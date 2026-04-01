@@ -159,6 +159,7 @@ export const DEFAULT_CUSTOM_CATEGORIES: Record<string, string> = {
 const ALLOWED_KEYS = [
   "mode",
   "apiKey",
+  "host",
   "userId",
   "orgId",
   "projectId",
@@ -216,6 +217,8 @@ export const mem0ConfigSchema = {
       mode,
       apiKey:
         typeof cfg.apiKey === "string" ? resolveEnvVars(cfg.apiKey) : undefined,
+      host:
+        typeof cfg.host === "string" ? resolveEnvVars(cfg.host) : undefined,
       userId:
         typeof cfg.userId === "string" && cfg.userId ? cfg.userId : "default",
       orgId: typeof cfg.orgId === "string" ? cfg.orgId : undefined,

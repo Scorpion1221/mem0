@@ -8,6 +8,7 @@ export type Mem0Config = {
   mode: Mem0Mode;
   // Platform-specific
   apiKey?: string;
+  host?: string;
   orgId?: string;
   projectId?: string;
   customInstructions: string;

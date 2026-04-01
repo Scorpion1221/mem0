@@ -819,6 +819,55 @@ function registerCli(
 }
 
 // ============================================================================
+// Context-Aware Recall Query Builder
+// ============================================================================
+
+/**
+ * Build an enriched search query for memory recall by combining the current
+ * prompt with the previous turn's context. This improves recall quality for
+ * short/vague prompts like "继续" (continue) or "go on" by anchoring the
+ * search to the topic of the previous exchange.
+ *
+ * Strategy:
+ * - If current prompt is long enough (≥80 chars), use it directly — it has
+ *   enough semantic signal on its own.
+ * - Otherwise, prepend the previous user message + assistant reply (head-truncated)
+ *   to provide topical context for the vector search.
+ * - Noise filtering: skip generic assistant replies ("ok", "got it", etc.)
+ */
+function buildRecallQuery(
+  currentPrompt: string,
+  lastTurn: { userMessage: string; assistantReply: string } | null,
+): string {
+  // Long prompts have sufficient semantic signal
+  if (currentPrompt.length >= 80 || !lastTurn) return currentPrompt;
+
+  const parts: string[] = [];
+
+  // Previous user message (provides topic context)
+  if (lastTurn.userMessage) {
+    parts.push(lastTurn.userMessage);
+  }
+
+  // Previous assistant reply (provides conclusion/topic anchor)
+  // Skip if it's a noise/generic response
+  if (
+    lastTurn.assistantReply &&
+    lastTurn.assistantReply.length >= 10 &&
+    !/^(ok|got it|sure|is there anything|how can i help|understood|done)/i.test(
+      lastTurn.assistantReply,
+    )
+  ) {
+    parts.push(lastTurn.assistantReply);
+  }
+
+  // Current prompt always goes last (highest semantic weight for embedding)
+  parts.push(currentPrompt);
+
+  return parts.join("\n");
+}
+
+// ============================================================================
 // Lifecycle Hook Registration
 // ============================================================================
 
@@ -833,10 +882,13 @@ function registerHooks(
     setCurrentSessionId: (id: string) => void;
   },
 ) {
+  // Cache last turn for context-aware recall: agent_end writes, before_agent_start reads
+  let lastTurn: { userMessage: string; assistantReply: string } | null = null;
+
   // Auto-recall: inject relevant memories before agent starts
   if (cfg.autoRecall) {
     api.on("before_agent_start", async (event, ctx) => {
-      if (!event.prompt || event.prompt.length < 5) return;
+      if (!event.prompt || event.prompt.length < 2) return;
 
       // Skip non-interactive triggers (cron, heartbeat, automation)
       const trigger = (ctx as any)?.trigger ?? undefined;
@@ -859,12 +911,15 @@ function registerHooks(
       const recallSessionKey = isSubagent ? undefined : sessionId;
 
       try {
+        // Build context-aware search query from last turn + current prompt
+        const searchQuery = buildRecallQuery(event.prompt, lastTurn);
+
         // Use a larger candidate pool for recall, then filter down
         const recallTopK = Math.max((cfg.topK ?? 5) * 2, 10);
 
         // Search long-term memories (user-scoped; subagents read from parent namespace)
         let longTermResults = await provider.search(
-          event.prompt,
+          searchQuery,
           buildSearchOptions(undefined, recallTopK, undefined, recallSessionKey),
         );
 
@@ -913,7 +968,7 @@ function registerHooks(
         let sessionResults: MemoryItem[] = [];
         if (sessionId) {
           sessionResults = await provider.search(
-            event.prompt,
+            searchQuery,
             buildSearchOptions(undefined, undefined, sessionId, recallSessionKey),
           );
           sessionResults = sessionResults.filter(
@@ -1118,6 +1173,19 @@ function registerHooks(
         if (capturedCount > 0) {
           api.logger.info(
             `openclaw-mem0: auto-captured ${capturedCount} memories`,
+          );
+        }
+
+        // Cache last turn for context-aware recall in next before_agent_start
+        const lastUserMsg = allParsed.filter((m) => m.role === "user").pop();
+        const lastAssistantMsg = allParsed.filter((m) => m.role === "assistant").pop();
+        if (lastUserMsg && lastAssistantMsg) {
+          lastTurn = {
+            userMessage: lastUserMsg.content.slice(0, 500),
+            assistantReply: lastAssistantMsg.content.slice(-300),
+          };
+          api.logger.info(
+            `openclaw-mem0: cached last turn for context-aware recall (user: ${lastTurn.userMessage.length} chars, assistant: ${lastTurn.assistantReply.length} chars)`,
           );
         }
       } catch (err) {
