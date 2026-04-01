@@ -292,6 +292,110 @@ class OSSProvider implements Mem0Provider {
 }
 
 // ============================================================================
+// Self-Hosted Provider (direct HTTP, no SDK dependency)
+// ============================================================================
+
+/**
+ * Provider for self-hosted mem0 REST API deployments.
+ *
+ * The self-hosted API differs from the platform API:
+ * - No /v1/ or /v2/ path prefix (e.g. /memories, /search)
+ * - Uses X-API-Key header instead of Authorization: Token
+ * - No /v1/ping/ endpoint
+ * - Search endpoint is /search, not /v2/memories/search/
+ */
+class SelfHostedProvider implements Mem0Provider {
+  private readonly host: string;
+  private readonly headers: Record<string, string>;
+
+  constructor(host: string, apiKey: string) {
+    this.host = host.replace(/\/+$/, ""); // strip trailing slash
+    this.headers = {
+      "X-API-Key": apiKey,
+      "Content-Type": "application/json",
+    };
+  }
+
+  private async request(path: string, options: { method: string; body?: string }): Promise<any> {
+    const url = `${this.host}${path}`;
+    const resp = await fetch(url, {
+      method: options.method,
+      headers: this.headers,
+      body: options.body,
+      redirect: "follow",
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`mem0 self-hosted API error ${resp.status}: ${text}`);
+    }
+    const contentType = resp.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      return resp.json();
+    }
+    return {};
+  }
+
+  async add(
+    messages: Array<{ role: string; content: string }>,
+    options: AddOptions,
+  ): Promise<AddResult> {
+    const payload: Record<string, unknown> = {
+      messages,
+      user_id: options.user_id,
+    };
+    if (options.run_id) payload.run_id = options.run_id;
+    if (options.custom_instructions) payload.custom_instructions = options.custom_instructions;
+
+    const result = await this.request("/memories", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    return normalizeAddResult(result);
+  }
+
+  async search(query: string, options: SearchOptions): Promise<MemoryItem[]> {
+    const payload: Record<string, unknown> = {
+      query,
+      user_id: options.user_id,
+    };
+    if (options.top_k != null) payload.top_k = options.top_k;
+    if (options.limit != null) payload.limit = options.limit;
+    if (options.run_id) payload.run_id = options.run_id;
+    if (options.threshold != null) payload.threshold = options.threshold;
+    if (options.keyword_search != null) payload.keyword_search = options.keyword_search;
+    if (options.reranking != null) payload.reranking = options.reranking;
+
+    const result = await this.request("/search", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    return normalizeSearchResults(result);
+  }
+
+  async get(memoryId: string): Promise<MemoryItem> {
+    const result = await this.request(`/memories/${memoryId}`, { method: "GET" });
+    return normalizeMemoryItem(result);
+  }
+
+  async getAll(options: ListOptions): Promise<MemoryItem[]> {
+    const params = new URLSearchParams();
+    params.set("user_id", options.user_id);
+    if (options.run_id) params.set("run_id", options.run_id);
+    if (options.page_size != null) params.set("page_size", String(options.page_size));
+
+    const result = await this.request(`/memories?${params.toString()}`, { method: "GET" });
+    if (Array.isArray(result)) return result.map(normalizeMemoryItem);
+    if (result?.results && Array.isArray(result.results))
+      return result.results.map(normalizeMemoryItem);
+    return [];
+  }
+
+  async delete(memoryId: string): Promise<void> {
+    await this.request(`/memories/${memoryId}`, { method: "DELETE" });
+  }
+}
+
+// ============================================================================
 // Provider Factory
 // ============================================================================
 
@@ -305,5 +409,11 @@ export function createProvider(
     );
   }
 
-  return new PlatformProvider(cfg.apiKey!, cfg.orgId, cfg.projectId, cfg.host);
+  // Self-hosted: use direct HTTP provider (no SDK, no ping, correct auth)
+  if (cfg.host) {
+    api.logger.info(`openclaw-mem0: using self-hosted provider at ${cfg.host}`);
+    return new SelfHostedProvider(cfg.host, cfg.apiKey!);
+  }
+
+  return new PlatformProvider(cfg.apiKey!, cfg.orgId, cfg.projectId);
 }
