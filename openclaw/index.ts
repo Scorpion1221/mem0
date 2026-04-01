@@ -30,6 +30,7 @@ import { createProvider } from "./providers.ts";
 import { mem0ConfigSchema } from "./config.ts";
 import {
   filterMessagesForExtraction,
+  stripNoiseFromContent,
 } from "./filtering.ts";
 import {
   effectiveUserId,
@@ -839,8 +840,11 @@ function buildRecallQuery(
   currentPrompt: string,
   lastTurn: { userMessage: string; assistantReply: string } | null,
 ): string {
+  // Strip media metadata and other noise from the prompt before using as search query
+  const cleanPrompt = stripNoiseFromContent(currentPrompt);
+
   // Long prompts have sufficient semantic signal
-  if (currentPrompt.length >= 80 || !lastTurn) return currentPrompt;
+  if (cleanPrompt.length >= 80 || !lastTurn) return cleanPrompt;
 
   const parts: string[] = [];
 
@@ -862,7 +866,7 @@ function buildRecallQuery(
   }
 
   // Current prompt always goes last (highest semantic weight for embedding)
-  parts.push(currentPrompt);
+  parts.push(cleanPrompt);
 
   return parts.join("\n");
 }
@@ -913,6 +917,9 @@ function registerHooks(
       try {
         // Build context-aware search query from last turn + current prompt
         const searchQuery = buildRecallQuery(event.prompt, lastTurn);
+        api.logger.info(
+          `openclaw-mem0: recall query (${searchQuery.length} chars, hasContext: ${lastTurn != null}):\n${searchQuery.slice(0, 500)}`,
+        );
 
         // Use a larger candidate pool for recall, then filter down
         const recallTopK = Math.max((cfg.topK ?? 5) * 2, 10);

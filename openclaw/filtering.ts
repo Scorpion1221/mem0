@@ -22,7 +22,10 @@ const NOISE_MESSAGE_PATTERNS: RegExp[] = [
 /** Content fragments that should be stripped from otherwise-valid messages. */
 const NOISE_CONTENT_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
   { pattern: /Conversation info \(untrusted metadata\):\s*```json\s*\{[\s\S]*?\}\s*```/g, replacement: "" },
+  { pattern: /Sender \(untrusted metadata\):\s*```json\s*\{[\s\S]*?\}\s*```/g, replacement: "" },
+  { pattern: /^System: \[\d{4}-\d{2}-\d{2}[^\]]*\] [^\n]*/gm, replacement: "" },
   { pattern: /\[media attached:.*?\]/g, replacement: "" },
+  { pattern: /^\/?Users\/[^\s]+\.(jpg|jpeg|png|gif|webp|svg|mp4|mp3|wav|pdf)\s*$/gim, replacement: "" },
   { pattern: /To send an image back, prefer the message tool[\s\S]*?Keep caption in the text body\./g, replacement: "" },
   { pattern: /System: \[\d{4}-\d{2}-\d{2}.*?\] ⚠️ Post-Compaction Audit:[\s\S]*?after memory compaction\./g, replacement: "" },
   { pattern: /Replied message \(untrusted, for context\):\s*```json[\s\S]*?```/g, replacement: "" },
