@@ -25,12 +25,12 @@ services:
     environment:
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
-      - QDRANT_API_KEY=c36be684def5318bcd7b46445c4dbc2454ce1b16a229932585168ed63f52c132
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
 
   qdrant:
     image: qdrant/qdrant:latest
     environment:
-      - QDRANT__SERVICE__API_KEY=c36be684def5318bcd7b46445c4dbc2454ce1b16a229932585168ed63f52c132
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}
     restart: always
     networks:
       - mem0_network
