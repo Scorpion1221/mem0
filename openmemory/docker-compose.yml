@@ -1,6 +1,7 @@
 services:
   mem0_store:
     image: qdrant/qdrant
+    environment:
     ports:
       - "6333:6333"
     volumes:

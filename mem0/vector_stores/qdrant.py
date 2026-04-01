@@ -56,6 +56,7 @@ class Qdrant(VectorStoreBase):
         else:
             params = {}
             if api_key:
+                params["https"] = False
                 params["api_key"] = api_key
             if url:
                 params["url"] = url

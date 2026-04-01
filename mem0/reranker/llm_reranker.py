@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Any, Dict, List, Union
 
@@ -8,34 +9,21 @@ from mem0.utils.factory import LlmFactory
 
 
 class LLMReranker(BaseReranker):
-    """LLM-based reranker implementation."""
-
     def __init__(self, config: Union[BaseRerankerConfig, LLMRerankerConfig, Dict]):
-        """
-        Initialize LLM reranker.
-
-        Args:
-            config: Configuration object with reranker parameters
-        """
-        # Convert to LLMRerankerConfig if needed
         if isinstance(config, dict):
             config = LLMRerankerConfig(**config)
         elif isinstance(config, BaseRerankerConfig) and not isinstance(config, LLMRerankerConfig):
-            # Convert BaseRerankerConfig to LLMRerankerConfig with defaults
             config = LLMRerankerConfig(
-                provider=getattr(config, 'provider', 'openai'),
-                model=getattr(config, 'model', 'gpt-4o-mini'),
-                api_key=getattr(config, 'api_key', None),
-                top_k=getattr(config, 'top_k', None),
-                temperature=0.0,  # Default for reranking
-                max_tokens=100,   # Default for reranking
+                provider=getattr(config, "provider", "openai"),
+                model=getattr(config, "model", "gpt-4o-mini"),
+                api_key=getattr(config, "api_key", None),
+                top_k=getattr(config, "top_k", None),
+                temperature=0.0,
+                max_tokens=500,
             )
 
         self.config = config
 
-        # If a nested ``llm`` dict is provided (e.g. for non-OpenAI providers
-        # like Ollama that need provider-specific fields such as
-        # ``ollama_base_url``), use it to configure the LLM factory.
         if self.config.llm:
             nested = self.config.llm
             llm_provider = nested.get("provider", self.config.provider)
@@ -55,99 +43,91 @@ class LLMReranker(BaseReranker):
             if self.config.api_key:
                 llm_config["api_key"] = self.config.api_key
 
-        # Initialize LLM using the factory
         self.llm = LlmFactory.create(llm_provider, llm_config)
 
-        # Default scoring prompt
-        self.scoring_prompt = getattr(self.config, 'scoring_prompt', None) or self._get_default_prompt()
-        
-    def _get_default_prompt(self) -> str:
-        """Get the default scoring prompt template."""
-        return """You are a relevance scoring assistant. Given a query and a document, you need to score how relevant the document is to the query.
+    def _get_doc_text(self, doc: Dict[str, Any]) -> str:
+        if "memory" in doc:
+            return doc["memory"]
+        elif "text" in doc:
+            return doc["text"]
+        elif "content" in doc:
+            return doc["content"]
+        return str(doc)
 
-Score the relevance on a scale from 0.0 to 1.0, where:
-- 1.0 = Perfectly relevant and directly answers the query
-- 0.8-0.9 = Highly relevant with good information
-- 0.6-0.7 = Moderately relevant with some useful information  
-- 0.4-0.5 = Slightly relevant with limited useful information
-- 0.0-0.3 = Not relevant or no useful information
+    def _build_batch_prompt(self, query: str, doc_texts: List[str]) -> str:
+        docs_section = chr(10).join(
+            f"[{i}] {text}" for i, text in enumerate(doc_texts)
+        )
+        return (
+            "对每条记忆与查询的相关性打分（0.00-1.00），要求分数有区分度，避免全部相同。\n"
+            "\n"
+            "评分标准：\n"
+            "- 0.90-1.00：直接回答查询，高度匹配\n"
+            "- 0.70-0.89：主题相关，包含有用信息\n"
+            "- 0.40-0.69：间接相关或部分匹配\n"
+            "- 0.10-0.39：弱相关，仅有微弱联系\n"
+            "- 0.00-0.09：完全无关\n"
+            "\n"
+            "示例：\n"
+            '查询："项目部署状态"\n'
+            "[0] 昨天完成了生产环境部署 -> 0.92\n"
+            "[1] 项目使用 Docker 容器化 -> 0.55\n"
+            "[2] 今天天气不错 -> 0.02\n"
+            "输出：[0.92, 0.55, 0.02]\n"
+            "\n"
+            f'现在请打分：\n'
+            f'查询："{query}"\n'
+            f"\n"
+            f"记忆：\n"
+            f"{docs_section}\n"
+            f"\n"
+            "仅输出 JSON 数组，如 [0.85, 0.42, 0.15]"
+        )
 
-Query: "{query}"
-Document: "{document}"
+    def _parse_scores(self, response: str, n: int) -> List[float]:
+        match = re.search(r"\[([\d.,\s]+)\]", response)
+        if match:
+            try:
+                scores = json.loads("[" + match.group(1) + "]")
+                if len(scores) == n:
+                    return [min(max(float(s), 0.0), 1.0) for s in scores]
+            except (json.JSONDecodeError, ValueError):
+                pass
 
-Provide only a single numerical score between 0.0 and 1.0. Do not include any explanation or additional text."""
+        pattern = r"\b([01](?:\.\d+)?)\b"
+        matches = re.findall(pattern, response)
+        scores = [float(m) for m in matches[:n]]
 
-    def _extract_score(self, response_text: str) -> float:
-        """Extract numerical score from LLM response."""
-        # Look for decimal numbers between 0.0 and 1.0
-        pattern = r'\b([01](?:\.\d+)?)\b'
-        matches = re.findall(pattern, response_text)
-        
-        if matches:
-            score = float(matches[0])
-            return min(max(score, 0.0), 1.0)  # Clamp between 0.0 and 1.0
-        
-        # Fallback: return 0.5 if no valid score found
-        return 0.5
-    
+        while len(scores) < n:
+            scores.append(0.5)
+        return [min(max(s, 0.0), 1.0) for s in scores[:n]]
+
     def rerank(self, query: str, documents: List[Dict[str, Any]], top_k: int = None) -> List[Dict[str, Any]]:
-        """
-        Rerank documents using LLM scoring.
-        
-        Args:
-            query: The search query
-            documents: List of documents to rerank
-            top_k: Number of top documents to return
-            
-        Returns:
-            List of reranked documents with rerank_score
-        """
         if not documents:
             return documents
-        
-        scored_docs = []
-        
-        for doc in documents:
-            # Extract text content
-            if 'memory' in doc:
-                doc_text = doc['memory']
-            elif 'text' in doc:
-                doc_text = doc['text']  
-            elif 'content' in doc:
-                doc_text = doc['content']
-            else:
-                doc_text = str(doc)
-            
-            try:
-                # Generate scoring prompt
-                prompt = self.scoring_prompt.format(query=query, document=doc_text)
-                
-                # Get LLM response
-                response = self.llm.generate_response(
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                
-                # Extract score from response
-                score = self._extract_score(response)
-                
-                # Create scored document
-                scored_doc = doc.copy()
-                scored_doc['rerank_score'] = score
-                scored_docs.append(scored_doc)
 
-            except Exception:
-                # Fallback: assign neutral score if scoring fails
-                scored_doc = doc.copy()
-                scored_doc['rerank_score'] = 0.5
-                scored_docs.append(scored_doc)
-        
-        # Sort by relevance score in descending order
-        scored_docs.sort(key=lambda x: x['rerank_score'], reverse=True)
-        
-        # Apply top_k limit
-        if top_k:
-            scored_docs = scored_docs[:top_k]
-        elif self.config.top_k:
-            scored_docs = scored_docs[:self.config.top_k]
-            
+        doc_texts = [self._get_doc_text(doc) for doc in documents]
+
+        try:
+            prompt = self._build_batch_prompt(query, doc_texts)
+            response = self.llm.generate_response(
+                messages=[{"role": "user", "content": prompt}]
+            )
+            scores = self._parse_scores(response, len(documents))
+        except Exception:
+            scores = [0.5] * len(documents)
+
+        scored_docs = []
+        for doc, score in zip(documents, scores):
+            scored_doc = doc.copy()
+            scored_doc["rerank_score"] = score
+            scored_docs.append(scored_doc)
+
+        scored_docs.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+        limit = top_k or self.config.top_k
+        if limit:
+            scored_docs = scored_docs[:limit]
+
         return scored_docs
+
