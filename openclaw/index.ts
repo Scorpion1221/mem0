@@ -887,7 +887,8 @@ function registerHooks(
   },
 ) {
   // Cache last turn for context-aware recall: agent_end writes, before_agent_start reads
-  let lastTurn: { userMessage: string; assistantReply: string } | null = null;
+  // Keyed by sessionKey to prevent cross-channel contamination
+  const lastTurnBySession = new Map<string, { userMessage: string; assistantReply: string }>();
 
   // Auto-recall: inject relevant memories before agent starts
   if (cfg.autoRecall) {
@@ -916,9 +917,10 @@ function registerHooks(
 
       try {
         // Build context-aware search query from last turn + current prompt
+        const lastTurn = sessionId ? lastTurnBySession.get(sessionId) ?? null : null;
         const searchQuery = buildRecallQuery(event.prompt, lastTurn);
         api.logger.info(
-          `openclaw-mem0: recall query (${searchQuery.length} chars, hasContext: ${lastTurn != null}):\n${searchQuery.slice(0, 500)}`,
+          `openclaw-mem0: recall query (${searchQuery.length} chars, hasContext: ${lastTurn != null}, session: ${sessionId?.slice(-20)}):\n${searchQuery.slice(0, 500)}`,
         );
 
         // Use a larger candidate pool for recall, then filter down
@@ -1186,13 +1188,19 @@ function registerHooks(
         // Cache last turn for context-aware recall in next before_agent_start
         const lastUserMsg = allParsed.filter((m) => m.role === "user").pop();
         const lastAssistantMsg = allParsed.filter((m) => m.role === "assistant").pop();
-        if (lastUserMsg && lastAssistantMsg) {
-          lastTurn = {
+        if (lastUserMsg && lastAssistantMsg && sessionId) {
+          const cachedTurn = {
             userMessage: stripNoiseFromContent(lastUserMsg.content).slice(0, 500),
             assistantReply: stripNoiseFromContent(lastAssistantMsg.content).slice(-300),
           };
+          lastTurnBySession.set(sessionId, cachedTurn);
+          // Evict stale entries to prevent unbounded growth (keep last 50 sessions)
+          if (lastTurnBySession.size > 50) {
+            const firstKey = lastTurnBySession.keys().next().value;
+            if (firstKey) lastTurnBySession.delete(firstKey);
+          }
           api.logger.info(
-            `openclaw-mem0: cached last turn for context-aware recall (user: ${lastTurn.userMessage.length} chars, assistant: ${lastTurn.assistantReply.length} chars)`,
+            `openclaw-mem0: cached last turn for session ${sessionId.slice(-20)} (user: ${cachedTurn.userMessage.length} chars, assistant: ${cachedTurn.assistantReply.length} chars)`,
           );
         }
       } catch (err) {
