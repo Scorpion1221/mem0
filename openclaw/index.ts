@@ -926,17 +926,38 @@ function registerHooks(
         // Use a larger candidate pool for recall, then filter down
         const recallTopK = Math.max((cfg.topK ?? 5) * 2, 10);
 
-        // Search long-term memories (user-scoped; subagents read from parent namespace)
-        let longTermResults = await provider.search(
-          searchQuery,
-          buildSearchOptions(undefined, recallTopK, undefined, recallSessionKey),
-        );
+        // Fire all 3 search requests in parallel to avoid serial latency
+        const needsBroad = event.prompt.length < 100 || isNewSession;
+        const broadOpts = buildSearchOptions(undefined, 5, undefined, recallSessionKey);
+        broadOpts.threshold = 0.5;
+
+        const [rawLongTerm, broadResults, rawSession] = await Promise.all([
+          // 1. Long-term memories (user-scoped; subagents read from parent namespace)
+          provider.search(
+            searchQuery,
+            buildSearchOptions(undefined, recallTopK, undefined, recallSessionKey),
+          ),
+          // 2. Broad recall for short/generic prompts or new sessions
+          needsBroad
+            ? provider.search(
+                "recent decisions, preferences, active projects, and configuration",
+                broadOpts,
+              )
+            : Promise.resolve([] as MemoryItem[]),
+          // 3. Session memories (session-scoped)
+          sessionId
+            ? provider.search(
+                searchQuery,
+                buildSearchOptions(undefined, undefined, sessionId, recallSessionKey),
+              )
+            : Promise.resolve([] as MemoryItem[]),
+        ]);
 
         // Client-side threshold filter for auto-recall — use a stricter
         // threshold (0.6) than explicit tool searches (0.5) to avoid
         // injecting irrelevant memories into agent context
         const recallThreshold = Math.max(cfg.searchThreshold, 0.6);
-        longTermResults = longTermResults.filter(
+        let longTermResults = rawLongTerm.filter(
           (r) => (r.score ?? 0) >= recallThreshold,
         );
 
@@ -951,17 +972,8 @@ function registerHooks(
           }
         }
 
-        // For short/generic prompts or new sessions, broaden recall
-        // with a general query to avoid cold-start blindness.
-        // Use a lower threshold (0.5) since the generic query is
-        // intentionally broad and strict thresholds defeat the purpose.
-        if (event.prompt.length < 100 || isNewSession) {
-          const broadOpts = buildSearchOptions(undefined, 5, undefined, recallSessionKey);
-          broadOpts.threshold = 0.5;
-          const broadResults = await provider.search(
-            "recent decisions, preferences, active projects, and configuration",
-            broadOpts,
-          );
+        // Merge broad results (deduplicated)
+        if (broadResults.length > 0) {
           const existingIds = new Set(longTermResults.map((r) => r.id));
           for (const r of broadResults) {
             if (!existingIds.has(r.id)) {
@@ -973,17 +985,10 @@ function registerHooks(
         // Cap at configured topK after filtering
         longTermResults = longTermResults.slice(0, cfg.topK);
 
-        // Search session memories (session-scoped) if we have a session ID
-        let sessionResults: MemoryItem[] = [];
-        if (sessionId) {
-          sessionResults = await provider.search(
-            searchQuery,
-            buildSearchOptions(undefined, undefined, sessionId, recallSessionKey),
-          );
-          sessionResults = sessionResults.filter(
-            (r) => (r.score ?? 0) >= cfg.searchThreshold,
-          );
-        }
+        // Filter session results
+        let sessionResults = rawSession.filter(
+          (r) => (r.score ?? 0) >= cfg.searchThreshold,
+        );
 
         // Deduplicate session results against long-term
         const longTermIds = new Set(longTermResults.map((r) => r.id));
