@@ -194,7 +194,7 @@ function registerTools(
       name: "memory_search",
       label: "Memory Search",
       description:
-        "Search through long-term memories stored in Mem0. Use when you need context about user preferences, past decisions, or previously discussed topics.",
+        "Search through long-term memories stored in Mem0. Use when you need context about user preferences, past decisions, or previously discussed topics. You can filter by categories like identity, preferences, goals, projects, technical, decisions, relationships, routines, etc.",
       parameters: Type.Object({
         query: Type.String({ description: "Search query" }),
         limit: Type.Optional(
@@ -214,6 +214,12 @@ function registerTools(
               "Agent ID to search memories for a specific agent (e.g. \"researcher\"). Overrides userId.",
           }),
         ),
+        categories: Type.Optional(
+          Type.Array(Type.String(), {
+            description:
+              'Filter by memory categories (e.g. ["identity", "projects"]). Only returns memories tagged with these categories.',
+          }),
+        ),
         scope: Type.Optional(
           Type.Union([
             Type.Literal("session"),
@@ -226,11 +232,12 @@ function registerTools(
         ),
       }),
       async execute(_toolCallId, params) {
-        const { query, limit, userId, agentId, scope = "all" } = params as {
+        const { query, limit, userId, agentId, categories, scope = "all" } = params as {
           query: string;
           limit?: number;
           userId?: string;
           agentId?: string;
+          categories?: string[];
           scope?: "session" | "long-term" | "all";
         };
 
@@ -239,29 +246,42 @@ function registerTools(
           const uid = _resolveUserId({ agentId, userId });
           const currentSessionId = getCurrentSessionId();
 
+          // Build category filter if specified
+          const catFilter: Record<string, unknown> | undefined =
+            categories && categories.length > 0
+              ? categories.length === 1
+                ? { category: categories[0] }
+                : { category: { in: categories } }
+              : undefined;
+
+          const addFilters = (opts: SearchOptions): SearchOptions => {
+            if (catFilter) opts.filters = { ...opts.filters, ...catFilter };
+            return opts;
+          };
+
           if (scope === "session") {
             if (currentSessionId) {
               results = await provider.search(
                 query,
-                buildSearchOptions(uid, limit, currentSessionId),
+                addFilters(buildSearchOptions(uid, limit, currentSessionId)),
               );
             }
           } else if (scope === "long-term") {
             results = await provider.search(
               query,
-              buildSearchOptions(uid, limit),
+              addFilters(buildSearchOptions(uid, limit)),
             );
           } else {
             // "all" — search both scopes and combine
             const longTermResults = await provider.search(
               query,
-              buildSearchOptions(uid, limit),
+              addFilters(buildSearchOptions(uid, limit)),
             );
             let sessionResults: MemoryItem[] = [];
             if (currentSessionId) {
               sessionResults = await provider.search(
                 query,
-                buildSearchOptions(uid, limit, currentSessionId),
+                addFilters(buildSearchOptions(uid, limit, currentSessionId)),
               );
             }
             // Deduplicate by ID, preferring long-term

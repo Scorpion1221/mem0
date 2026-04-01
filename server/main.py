@@ -1,6 +1,8 @@
 import logging
 import os
+import re as _re
 import secrets
+import threading
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -150,6 +152,7 @@ DEFAULT_CONFIG = {
 
 
 MEMORY_INSTANCE = Memory.from_config(DEFAULT_CONFIG)
+_prompt_lock = threading.Lock()
 
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -218,6 +221,11 @@ class MemoryCreate(BaseModel):
     infer: Optional[bool] = Field(None, description="Whether to extract facts from messages. Defaults to True.")
     memory_type: Optional[str] = Field(None, description="Type of memory to store (e.g. 'core').")
     prompt: Optional[str] = Field(None, description="Custom prompt to use for fact extraction.")
+    custom_instructions: Optional[str] = Field(None, description="Alias for prompt (openclaw compatibility).")
+    custom_categories: Optional[List[Dict[str, str]]] = Field(
+        None,
+        description='Category definitions, e.g. [{"identity": "Name, location..."}, {"projects": "Active projects..."}]',
+    )
 
 
 class SearchRequest(BaseModel):
@@ -238,19 +246,93 @@ def set_config(config: Dict[str, Any], _api_key: Optional[str] = Depends(verify_
     return {"message": "Configuration set successfully"}
 
 
+def _backfill_categories(results: List[Dict[str, Any]]):
+    """Extract category tags from memory text and store them in metadata.
+
+    The LLM is instructed to output facts like:
+      {"text": "用户叫张三", "category": "identity"}
+    but mem0 core only stores the text part in the memory field. When the
+    extraction prompt includes category instructions, the LLM sometimes
+    embeds the category as a prefix like "[identity] 用户叫张三". This
+    function detects such prefixes, strips them from the memory text, and
+    writes the category to metadata via MEMORY_INSTANCE.update().
+
+    It also handles cases where the memory text itself contains no tag —
+    in that case we skip (no category info to extract).
+    """
+    tag_pattern = _re.compile(r"^\[([a-z_]+)\]\s*")
+    for item in results:
+        if item.get("event") not in ("ADD", "UPDATE"):
+            continue
+        mem_id = item.get("id")
+        memory_text = item.get("memory", "")
+        if not mem_id or not memory_text:
+            continue
+
+        match = tag_pattern.match(memory_text)
+        if match:
+            category = match.group(1)
+            clean_text = memory_text[match.end():]
+            try:
+                MEMORY_INSTANCE.update(mem_id, data=clean_text, metadata={"category": category})
+                item["memory"] = clean_text
+                item["category"] = category
+            except Exception as e:
+                logging.warning(f"Failed to backfill category for {mem_id}: {e}")
+
+
 @app.post("/memories", summary="Create memories")
 def add_memory(memory_create: MemoryCreate, _api_key: Optional[str] = Depends(verify_api_key)):
     """Store new memories."""
     if not any([memory_create.user_id, memory_create.agent_id, memory_create.run_id]):
         raise HTTPException(status_code=400, detail="At least one identifier (user_id, agent_id, run_id) is required.")
 
-    params = {k: v for k, v in memory_create.model_dump().items() if v is not None and k != "messages"}
-    try:
-        response = MEMORY_INSTANCE.add(messages=[m.model_dump() for m in memory_create.messages], **params)
-        return JSONResponse(content=response)
-    except Exception as e:
-        logging.exception("Error in add_memory:")  # This will log the full traceback
-        raise HTTPException(status_code=500, detail=str(e))
+    params = {k: v for k, v in memory_create.model_dump().items() if v is not None and k not in ("messages", "prompt", "custom_instructions", "custom_categories")}
+
+    # Build effective prompt: per-request prompt > server default.
+    # If custom_categories provided, append category tagging instructions.
+    effective_prompt = memory_create.prompt or memory_create.custom_instructions
+    categories = memory_create.custom_categories
+
+    if categories:
+        cat_lines = "\n".join(f"- {k}: {v}" for cat in categories for k, v in cat.items())
+        cat_suffix = (
+            "\n\n## 分类要求\n"
+            "请为每条提取的事实加上分类前缀。可用分类:\n"
+            f"{cat_lines}\n\n"
+            "在每条 fact 文本前加 [分类名] 前缀，例如:\n"
+            '{"facts": ["[identity] 用户名叫张三", "[projects] 正在开发新功能"]}\n'
+            "如果没有匹配的分类，使用 [misc]。"
+        )
+        base_prompt = effective_prompt or CUSTOM_FACT_EXTRACTION_PROMPT
+        effective_prompt = base_prompt + cat_suffix
+
+    if effective_prompt:
+        with _prompt_lock:
+            original_prompt = MEMORY_INSTANCE.custom_fact_extraction_prompt
+            MEMORY_INSTANCE.custom_fact_extraction_prompt = effective_prompt
+            MEMORY_INSTANCE.config.custom_fact_extraction_prompt = effective_prompt
+            try:
+                response = MEMORY_INSTANCE.add(messages=[m.model_dump() for m in memory_create.messages], **params)
+            except Exception as e:
+                logging.exception("Error in add_memory:")
+                raise HTTPException(status_code=500, detail=str(e))
+            finally:
+                MEMORY_INSTANCE.custom_fact_extraction_prompt = original_prompt
+                MEMORY_INSTANCE.config.custom_fact_extraction_prompt = original_prompt
+    else:
+        try:
+            response = MEMORY_INSTANCE.add(messages=[m.model_dump() for m in memory_create.messages], **params)
+        except Exception as e:
+            logging.exception("Error in add_memory:")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Post-process: if custom_categories was used, try to extract category from
+    # the memory text (LLM may embed it) and store in metadata via update.
+    if categories and response.get("results"):
+        _backfill_categories(response["results"])
+
+    return JSONResponse(content=response)
 
 
 @app.get("/memories", summary="Get memories")

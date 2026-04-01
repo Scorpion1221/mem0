@@ -50,6 +50,7 @@ export interface SearchOptions {
   keyword_search?: boolean;
   reranking?: boolean;
   source?: string;
+  filters?: Record<string, unknown>;
 }
 
 export interface ListOptions {

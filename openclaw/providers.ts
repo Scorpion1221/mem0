@@ -254,6 +254,7 @@ class OSSProvider implements Mem0Provider {
     if (options.reranking != null) opts.reranking = options.reranking;
     if (options.source) opts.source = options.source;
     if (options.threshold != null) opts.threshold = options.threshold;
+    if (options.filters) opts.filters = options.filters;
 
     const results = await this.memory.search(query, opts);
     const normalized = normalizeSearchResults(results);
@@ -364,6 +365,7 @@ class SelfHostedProvider implements Mem0Provider {
     if (options.threshold != null) payload.threshold = options.threshold;
     if (options.keyword_search != null) payload.keyword_search = options.keyword_search;
     if (options.reranking != null) payload.reranking = options.reranking;
+    if (options.filters) payload.filters = options.filters;
 
     const result = await this.request("/search", {
       method: "POST",

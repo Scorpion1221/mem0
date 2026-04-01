@@ -14,6 +14,7 @@ import {
   isGenericAssistantMessage,
   stripNoiseFromContent,
   filterMessagesForExtraction,
+  mem0ConfigSchema,
 } from "./index.ts";
 
 // ---------------------------------------------------------------------------
@@ -484,6 +485,131 @@ What is the deployment plan?`,
     ];
     const result = filterMessagesForExtraction(messages);
     expect(result).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mem0ConfigSchema: customCategories parsing
+// ---------------------------------------------------------------------------
+describe("mem0ConfigSchema customCategories", () => {
+  const baseConfig = {
+    mode: "open-source",
+    userId: "test-user",
+  };
+
+  it("uses DEFAULT_CUSTOM_CATEGORIES when customCategories is not provided", () => {
+    const cfg = mem0ConfigSchema.parse(baseConfig);
+    expect(cfg.customCategories).toBeDefined();
+    expect(typeof cfg.customCategories).toBe("object");
+    // Default has 'identity' key
+    expect(cfg.customCategories).toHaveProperty("identity");
+    expect(cfg.customCategories).toHaveProperty("preferences");
+  });
+
+  it("accepts custom categories as Record<string, string>", () => {
+    const cfg = mem0ConfigSchema.parse({
+      ...baseConfig,
+      customCategories: {
+        projects: "Active projects",
+        technical: "Tech stack info",
+      },
+    });
+    expect(cfg.customCategories).toEqual({
+      projects: "Active projects",
+      technical: "Tech stack info",
+    });
+  });
+
+  it("ignores customCategories if it is an array (uses default)", () => {
+    const cfg = mem0ConfigSchema.parse({
+      ...baseConfig,
+      customCategories: [{ projects: "Active projects" }],
+    });
+    // Should fall back to default since Array.isArray check rejects it
+    expect(cfg.customCategories).toHaveProperty("identity");
+  });
+
+  it("ignores customCategories if it is a string (uses default)", () => {
+    const cfg = mem0ConfigSchema.parse({
+      ...baseConfig,
+      customCategories: "not valid",
+    });
+    expect(cfg.customCategories).toHaveProperty("identity");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mem0ConfigSchema: customPrompt / customInstructions parsing
+// ---------------------------------------------------------------------------
+describe("mem0ConfigSchema customPrompt", () => {
+  const baseConfig = {
+    mode: "open-source",
+    userId: "test-user",
+  };
+
+  it("uses DEFAULT_CUSTOM_INSTRUCTIONS when customPrompt is not provided", () => {
+    const cfg = mem0ConfigSchema.parse(baseConfig);
+    expect(cfg.customPrompt).toBeDefined();
+    expect(cfg.customPrompt).toContain("Extract durable");
+  });
+
+  it("accepts custom prompt string", () => {
+    const cfg = mem0ConfigSchema.parse({
+      ...baseConfig,
+      customPrompt: "My custom extraction prompt",
+    });
+    expect(cfg.customPrompt).toBe("My custom extraction prompt");
+  });
+
+  it("customInstructions defaults independently from customPrompt", () => {
+    const cfg = mem0ConfigSchema.parse({
+      ...baseConfig,
+      customInstructions: "Platform instructions",
+      customPrompt: "OSS prompt",
+    });
+    expect(cfg.customInstructions).toBe("Platform instructions");
+    expect(cfg.customPrompt).toBe("OSS prompt");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Category filter construction (mirrors the logic in memory_search tool)
+// ---------------------------------------------------------------------------
+describe("category filter construction", () => {
+  /** Replicate the filter-building logic from registerTools to verify it. */
+  function buildCategoryFilter(
+    categories: string[] | undefined,
+  ): Record<string, unknown> | undefined {
+    if (!categories || categories.length === 0) return undefined;
+    return categories.length === 1
+      ? { category: categories[0] }
+      : { category: { in: categories } };
+  }
+
+  it("returns undefined when categories is undefined", () => {
+    expect(buildCategoryFilter(undefined)).toBeUndefined();
+  });
+
+  it("returns undefined when categories is empty array", () => {
+    expect(buildCategoryFilter([])).toBeUndefined();
+  });
+
+  it("returns exact match filter for single category", () => {
+    expect(buildCategoryFilter(["identity"])).toEqual({
+      category: "identity",
+    });
+  });
+
+  it("returns 'in' filter for multiple categories", () => {
+    expect(buildCategoryFilter(["identity", "projects"])).toEqual({
+      category: { in: ["identity", "projects"] },
+    });
+  });
+
+  it("returns 'in' filter for three categories", () => {
+    expect(buildCategoryFilter(["identity", "projects", "technical"])).toEqual({
+      category: { in: ["identity", "projects", "technical"] },
+    });
   });
 });
 
