@@ -3,8 +3,9 @@ name: mem0-dev
 services:
   mem0:
     build:
-      context: ..  # Set context to parent directory
+      context: ..
       dockerfile: server/dev.Dockerfile
+    restart: always
     ports:
       - "8888:8000"
     env_file:
@@ -12,39 +13,36 @@ services:
     networks:
       - mem0_network
     volumes:
-      - ./history:/app/history      # History db location. By default, it creates a history.db file on the server folder
-      - .:/app                      # Server code. This allows to reload the app when the server code is updated
-      - ../mem0:/app/packages/mem0  # Mem0 library. This allows to reload the app when the library code is updated
+      - ./history:/app/history
+      - .:/app
+      - ../mem0:/app/packages/mem0
     depends_on:
-      postgres:
-        condition: service_healthy
+      qdrant:
+        condition: service_started
       neo4j:
         condition: service_healthy
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload  # Enable auto-reload
+    command: sh -c "sleep 5 && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
     environment:
-      - PYTHONDONTWRITEBYTECODE=1  # Prevents Python from writing .pyc files
-      - PYTHONUNBUFFERED=1  # Ensures Python output is sent straight to terminal
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      - QDRANT_API_KEY=c36be684def5318bcd7b46445c4dbc2454ce1b16a229932585168ed63f52c132
 
-  postgres:
-      image: ankane/pgvector:v0.5.1
-      restart: on-failure
-      shm_size: "128mb" # Increase this if vacuuming fails with a "no space left on device" error
-      networks:
-        - mem0_network
-      environment:
-        - POSTGRES_USER=postgres
-        - POSTGRES_PASSWORD=postgres
-      healthcheck:
-        test: ["CMD", "pg_isready", "-q", "-d", "postgres", "-U", "postgres"]
-        interval: 5s
-        timeout: 5s
-        retries: 5
-      volumes:
-        - postgres_db:/var/lib/postgresql/data
-      ports:
-        - "8432:5432"
+  qdrant:
+    image: qdrant/qdrant:latest
+    environment:
+      - QDRANT__SERVICE__API_KEY=c36be684def5318bcd7b46445c4dbc2454ce1b16a229932585168ed63f52c132
+    restart: always
+    networks:
+      - mem0_network
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
   neo4j:
     image: neo4j:5.26.4
+    restart: always
     networks:
       - mem0_network
     healthcheck:
@@ -54,20 +52,20 @@ services:
       retries: 20
       start_period: 90s
     ports:
-      - "8474:7474" # HTTP
-      - "8687:7687" # Bolt
+      - "8474:7474"
+      - "8687:7687"
     volumes:
       - neo4j_data:/data
     environment:
       - NEO4J_AUTH=neo4j/mem0graph
-      - NEO4J_PLUGINS=["apoc"]  # Add this line to install APOC
+      - NEO4J_PLUGINS=["apoc"]
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
       - NEO4J_apoc_import_file_use__neo4j__config=true
 
 volumes:
   neo4j_data:
-  postgres_db:
+  qdrant_data:
 
 networks:
   mem0_network:
