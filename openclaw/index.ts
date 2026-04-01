@@ -1188,8 +1188,8 @@ function registerHooks(
         const lastAssistantMsg = allParsed.filter((m) => m.role === "assistant").pop();
         if (lastUserMsg && lastAssistantMsg) {
           lastTurn = {
-            userMessage: lastUserMsg.content.slice(0, 500),
-            assistantReply: lastAssistantMsg.content.slice(-300),
+            userMessage: stripNoiseFromContent(lastUserMsg.content).slice(0, 500),
+            assistantReply: stripNoiseFromContent(lastAssistantMsg.content).slice(-300),
           };
           api.logger.info(
             `openclaw-mem0: cached last turn for context-aware recall (user: ${lastTurn.userMessage.length} chars, assistant: ${lastTurn.assistantReply.length} chars)`,
