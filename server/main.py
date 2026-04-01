@@ -246,39 +246,79 @@ def set_config(config: Dict[str, Any], _api_key: Optional[str] = Depends(verify_
     return {"message": "Configuration set successfully"}
 
 
-def _backfill_categories(results: List[Dict[str, Any]]):
-    """Extract category tags from memory text and store them in metadata.
+import json as _json
 
-    The LLM is instructed to output facts like:
-      {"text": "用户叫张三", "category": "identity"}
-    but mem0 core only stores the text part in the memory field. When the
-    extraction prompt includes category instructions, the LLM sometimes
-    embeds the category as a prefix like "[identity] 用户叫张三". This
-    function detects such prefixes, strips them from the memory text, and
-    writes the category to metadata via MEMORY_INSTANCE.update().
 
-    It also handles cases where the memory text itself contains no tag —
-    in that case we skip (no category info to extract).
+def _backfill_categories(results: List[Dict[str, Any]], categories: List[Dict[str, str]]):
+    """Classify memories and store category in metadata via a single LLM call.
+
+    After mem0 add() returns, the memory text is clean (no [tag] prefix) because
+    mem0's internal update-memory LLM strips any prefix during deduplication.
+    So we do a separate batch classification: send all new memories + category
+    definitions to the LLM, get back a mapping, then call update() per memory.
     """
-    tag_pattern = _re.compile(r"^\[([a-z_]+)\]\s*")
-    for item in results:
-        if item.get("event") not in ("ADD", "UPDATE"):
-            continue
-        mem_id = item.get("id")
-        memory_text = item.get("memory", "")
-        if not mem_id or not memory_text:
-            continue
+    actionable = [
+        item for item in results
+        if item.get("event") in ("ADD", "UPDATE") and item.get("id") and item.get("memory")
+    ]
+    if not actionable:
+        return
 
-        match = tag_pattern.match(memory_text)
+    # Also try [tag] prefix match first (works when update-memory LLM preserves it)
+    tag_pattern = _re.compile(r"^\[([a-z_]+)\]\s*")
+    remaining = []
+    for item in actionable:
+        match = tag_pattern.match(item["memory"])
         if match:
             category = match.group(1)
-            clean_text = memory_text[match.end():]
+            clean_text = item["memory"][match.end():]
             try:
-                MEMORY_INSTANCE.update(mem_id, data=clean_text, metadata={"category": category})
+                MEMORY_INSTANCE.update(item["id"], data=clean_text, metadata={"category": category})
                 item["memory"] = clean_text
                 item["category"] = category
             except Exception as e:
-                logging.warning(f"Failed to backfill category for {mem_id}: {e}")
+                logging.warning(f"Failed to backfill category for {item['id']}: {e}")
+        else:
+            remaining.append(item)
+
+    if not remaining:
+        return
+
+    # Batch LLM classification for memories without [tag] prefix
+    cat_names = [k for cat in categories for k in cat.keys()]
+    cat_desc = ", ".join(f"{k}({v})" for cat in categories for k, v in cat.items())
+    memories_list = "\n".join(f"[{i}] {item['memory']}" for i, item in enumerate(remaining))
+
+    prompt = (
+        f"将以下记忆分类到最匹配的类别中。可用类别: {cat_desc}\n\n"
+        f"{memories_list}\n\n"
+        f'仅输出 JSON 数组，元素为类别名，顺序对应上方编号。如 ["{cat_names[0]}", "{cat_names[-1]}"]'
+    )
+
+    try:
+        response = MEMORY_INSTANCE.llm.generate_response(
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        # Parse: might be a raw array or {"categories": [...]} or {"result": [...]}
+        parsed = _json.loads(response)
+        if isinstance(parsed, list):
+            labels = parsed
+        elif isinstance(parsed, dict):
+            labels = parsed.get("categories") or parsed.get("result") or list(parsed.values())[0]
+        else:
+            labels = []
+
+        for i, item in enumerate(remaining):
+            if i < len(labels) and labels[i] in cat_names:
+                category = labels[i]
+                try:
+                    MEMORY_INSTANCE.update(item["id"], data=item["memory"], metadata={"category": category})
+                    item["category"] = category
+                except Exception as e:
+                    logging.warning(f"Failed to update category for {item['id']}: {e}")
+    except Exception as e:
+        logging.warning(f"Batch category classification failed: {e}")
 
 
 @app.post("/memories", summary="Create memories")
@@ -297,12 +337,25 @@ def add_memory(memory_create: MemoryCreate, _api_key: Optional[str] = Depends(ve
     if categories:
         cat_lines = "\n".join(f"- {k}: {v}" for cat in categories for k, v in cat.items())
         cat_suffix = (
-            "\n\n## 分类要求\n"
-            "请为每条提取的事实加上分类前缀。可用分类:\n"
+            "\n\n## 分类标注要求（覆盖上方输出格式）\n"
+            "请为每条提取的事实标注最匹配的分类。可用分类:\n"
             f"{cat_lines}\n\n"
-            "在每条 fact 文本前加 [分类名] 前缀，例如:\n"
-            '{"facts": ["[identity] 用户名叫张三", "[projects] 正在开发新功能"]}\n'
-            "如果没有匹配的分类，使用 [misc]。"
+            '【输出格式】每条 fact 必须是包含 "text" 和 "category" 的对象:\n'
+            '{"facts": [{"text": "事实内容", "category": "分类名"}, ...]}\n\n'
+            "以下是几个完整示例:\n\n"
+            "输入: 我叫张三，是一名软件工程师\n"
+            '输出: {"facts": [{"text": "用户名叫张三", "category": "identity"}, '
+            '{"text": "职业是软件工程师", "category": "identity"}]}\n\n'
+            "输入: 我最近在用 Rust 重写项目，比较喜欢函数式编程\n"
+            '输出: {"facts": [{"text": "正在用 Rust 重写项目", "category": "projects"}, '
+            '{"text": "喜欢函数式编程", "category": "preferences"}]}\n\n'
+            "输入: 今天天气不错\n"
+            '输出: {"facts": []}\n\n'
+            "输入: 我住在东京，周末喜欢跑步，正在准备明年的马拉松\n"
+            '输出: {"facts": [{"text": "居住在东京", "category": "identity"}, '
+            '{"text": "周末喜欢跑步", "category": "preferences"}, '
+            '{"text": "正在准备明年的马拉松", "category": "projects"}]}\n\n'
+            "如果没有匹配的分类，category 设为 \"misc\"。"
         )
         base_prompt = effective_prompt or CUSTOM_FACT_EXTRACTION_PROMPT
         effective_prompt = base_prompt + cat_suffix
@@ -327,10 +380,9 @@ def add_memory(memory_create: MemoryCreate, _api_key: Optional[str] = Depends(ve
             logging.exception("Error in add_memory:")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # Post-process: if custom_categories was used, try to extract category from
-    # the memory text (LLM may embed it) and store in metadata via update.
+    # Post-process: classify memories and store category in metadata.
     if categories and response.get("results"):
-        _backfill_categories(response["results"])
+        _backfill_categories(response["results"], categories)
 
     return JSONResponse(content=response)
 

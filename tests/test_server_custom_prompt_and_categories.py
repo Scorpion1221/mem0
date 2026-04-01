@@ -315,21 +315,27 @@ class TestBackfillCategories:
         assert update_calls[0] == call("mem-1", data="用户叫张三", metadata={"category": "identity"})
         assert update_calls[1] == call("mem-2", data="正在开发新功能", metadata={"category": "projects"})
 
-    def test_backfill_skips_untagged_memories(self, client, mock_memory):
-        """Memories without [tag] prefix should not trigger update()."""
+    def test_backfill_batch_classifies_untagged_memories(self, client, mock_memory):
+        """Memories without [tag] prefix should trigger batch LLM classification."""
         mock_memory.add.return_value = {
             "results": [
-                {"id": "mem-1", "event": "ADD", "memory": "普通记忆没有标签"},
+                {"id": "mem-1", "event": "ADD", "memory": "用户叫张三"},
             ]
         }
+        # Mock the LLM for batch classification
+        mock_memory.llm = MagicMock()
+        mock_memory.llm.generate_response.return_value = '["identity"]'
 
         client.post("/memories", json={
             "messages": [{"role": "user", "content": "test"}],
             "user_id": "u1",
-            "custom_categories": [{"identity": "Name"}],
+            "custom_categories": [{"identity": "Name"}, {"projects": "Projects"}],
         })
 
-        mock_memory.update.assert_not_called()
+        # LLM should be called for classification
+        mock_memory.llm.generate_response.assert_called_once()
+        # update() should be called with the classified category
+        mock_memory.update.assert_called_once_with("mem-1", data="用户叫张三", metadata={"category": "identity"})
 
     def test_backfill_skips_non_add_events(self, client, mock_memory):
         """Only ADD and UPDATE events should trigger backfill."""
@@ -400,6 +406,25 @@ class TestBackfillCategories:
 
         # Request should still succeed despite update failure
         assert resp.status_code == 200
+
+    def test_backfill_handles_llm_failure_gracefully(self, client, mock_memory):
+        """If batch LLM classification fails, the request should still succeed."""
+        mock_memory.add.return_value = {
+            "results": [
+                {"id": "mem-1", "event": "ADD", "memory": "用户叫张三"},
+            ]
+        }
+        mock_memory.llm = MagicMock()
+        mock_memory.llm.generate_response.side_effect = RuntimeError("LLM down")
+
+        resp = client.post("/memories", json={
+            "messages": [{"role": "user", "content": "test"}],
+            "user_id": "u1",
+            "custom_categories": [{"identity": "Name"}],
+        })
+
+        assert resp.status_code == 200
+        mock_memory.update.assert_not_called()
 
 
 # ===========================================================================

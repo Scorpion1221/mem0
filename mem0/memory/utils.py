@@ -99,6 +99,10 @@ def normalize_facts(raw_facts):
             if fact is None:
                 logger.warning("Unexpected fact shape from LLM, skipping: %s", item)
                 continue
+            # Preserve category tag as [tag] prefix so downstream can extract it
+            category = item.get("category")
+            if category and not fact.startswith("["):
+                fact = f"[{category}] {fact}"
         else:
             fact = str(item)
         if fact:
