@@ -105,11 +105,11 @@ const memoryPlugin = {
       const opts: AddOptions = {
         user_id: userIdOverride || _effectiveUserId(sessionKey),
         source: "OPENCLAW",
+        custom_instructions: cfg.customInstructions,
+        custom_categories: categoriesToArray(cfg.customCategories),
       };
       if (runId) opts.run_id = runId;
       if (cfg.mode === "platform") {
-        opts.custom_instructions = cfg.customInstructions;
-        opts.custom_categories = categoriesToArray(cfg.customCategories);
         opts.enable_graph = cfg.enableGraph;
         opts.output_format = "v1.1";
       }

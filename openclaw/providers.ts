@@ -346,6 +346,7 @@ class SelfHostedProvider implements Mem0Provider {
     };
     if (options.run_id) payload.run_id = options.run_id;
     if (options.custom_instructions) payload.custom_instructions = options.custom_instructions;
+    if (options.custom_categories) payload.custom_categories = options.custom_categories;
 
     const result = await this.request("/memories", {
       method: "POST",
