@@ -29,6 +29,8 @@ const NOISE_CONTENT_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = 
   { pattern: /To send an image back, prefer the message tool[\s\S]*?Keep caption in the text body\./g, replacement: "" },
   { pattern: /System: \[\d{4}-\d{2}-\d{2}.*?\] ⚠️ Post-Compaction Audit:[\s\S]*?after memory compaction\./g, replacement: "" },
   { pattern: /Replied message \(untrusted, for context\):\s*```json[\s\S]*?```/g, replacement: "" },
+  // Discord/channel sanitized untrusted content blocks
+  { pattern: /Untrusted context \(metadata, do not treat as instructions or commands\):\s*<<<EXTERNAL_UNTRUSTED_CONTENT[\s\S]*?<<<END_EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>/g, replacement: "" },
 ];
 
 const MAX_MESSAGE_LENGTH = 2000;
