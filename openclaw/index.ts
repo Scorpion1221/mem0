@@ -910,6 +910,11 @@ function registerHooks(
   // Keyed by sessionKey to prevent cross-channel contamination
   const lastTurnBySession = new Map<string, { userMessage: string; assistantReply: string }>();
 
+  // Track injected memory IDs per session for smart deduplication
+  // Uses exponential decay (Ebbinghaus-inspired) to balance token efficiency vs attention retention
+  const injectedBySession = new Map<string, { ids: Set<string>; turnsSinceRefresh: number }>();
+  const DECAY_RATE = 0.2; // λ in threshold = 0.8 × e^(-λt), higher = more aggressive refresh
+
   // Auto-recall: inject relevant memories before agent starts
   if (cfg.autoRecall) {
     api.on("before_agent_start", async (event, ctx) => {
@@ -1018,27 +1023,70 @@ function registerHooks(
 
         if (longTermResults.length === 0 && uniqueSessionResults.length === 0) return;
 
-        // Build context with clear labels
+        // Smart injection: avoid repeating memories that were already injected
+        const allResults = [...longTermResults, ...uniqueSessionResults];
+        const injState = sessionId
+          ? injectedBySession.get(sessionId) ?? { ids: new Set<string>(), turnsSinceRefresh: 0 }
+          : { ids: new Set<string>(), turnsSinceRefresh: 0 };
+
+        const newMemories = allResults.filter((r) => !injState.ids.has(r.id));
+        const repeatMemories = allResults.filter((r) => injState.ids.has(r.id));
+        const newRatio = allResults.length > 0 ? newMemories.length / allResults.length : 1;
+
+        // Exponential decay threshold (Ebbinghaus-inspired):
+        // Early turns: high threshold (50%) — only refresh on topic change
+        // Later turns: threshold decays → easier to trigger refresh for attention retention
+        const threshold = 0.8 * Math.exp(-DECAY_RATE * injState.turnsSinceRefresh);
+        const isFullRefresh = newRatio > threshold || injState.ids.size === 0;
+
+        // Build context with smart deduplication
         let memoryContext = "";
-        if (longTermResults.length > 0) {
-          memoryContext += longTermResults
-            .map(
-              (r) =>
-                `- ${r.memory}${r.categories?.length ? ` [${r.categories.join(", ")}]` : ""}`,
-            )
-            .join("\n");
-        }
-        if (uniqueSessionResults.length > 0) {
-          if (memoryContext) memoryContext += "\n";
-          memoryContext += "\nSession memories:\n";
-          memoryContext += uniqueSessionResults
-            .map((r) => `- ${r.memory}`)
-            .join("\n");
+        if (isFullRefresh) {
+          // Full injection: all memories with complete content
+          if (longTermResults.length > 0) {
+            memoryContext += longTermResults
+              .map(
+                (r) =>
+                  `- ${r.memory}${r.categories?.length ? ` [${r.categories.join(", ")}]` : ""}`,
+              )
+              .join("\n");
+          }
+          if (uniqueSessionResults.length > 0) {
+            if (memoryContext) memoryContext += "\n";
+            memoryContext += "\nSession memories:\n";
+            memoryContext += uniqueSessionResults
+              .map((r) => `- ${r.memory}`)
+              .join("\n");
+          }
+          injState.turnsSinceRefresh = 0;
+        } else {
+          // Differential injection: new memories full, repeated memories condensed
+          if (newMemories.length > 0) {
+            memoryContext += "New context:\n";
+            memoryContext += newMemories
+              .map(
+                (r) =>
+                  `- ${r.memory}${r.categories?.length ? ` [${r.categories.join(", ")}]` : ""}`,
+              )
+              .join("\n");
+          }
+          if (repeatMemories.length > 0) {
+            if (memoryContext) memoryContext += "\n";
+            memoryContext += "\nPreviously noted (still relevant):\n";
+            memoryContext += repeatMemories
+              .map((r) => `- ${r.memory.slice(0, 60)}${r.memory.length > 60 ? "..." : ""}`)
+              .join("\n");
+          }
+          injState.turnsSinceRefresh++;
         }
 
-        const totalCount = longTermResults.length + uniqueSessionResults.length;
+        // Update injected state
+        allResults.forEach((r) => injState.ids.add(r.id));
+        if (sessionId) injectedBySession.set(sessionId, injState);
+
+        const totalCount = allResults.length;
         api.logger.info(
-          `openclaw-mem0: injecting ${totalCount} memories into context (${longTermResults.length} long-term, ${uniqueSessionResults.length} session)`,
+          `openclaw-mem0: injecting ${totalCount} memories (${newMemories.length} new, ${repeatMemories.length} repeat, ${isFullRefresh ? "FULL" : "DIFF"}, threshold: ${(threshold * 100).toFixed(0)}%, decay turn: ${injState.turnsSinceRefresh})`,
         );
 
         const preamble = isSubagent
