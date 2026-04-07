@@ -8,21 +8,27 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { type Backend, getBackend } from "./backend/index.js";
-import { colors, printError } from "./branding.js";
+import { AuthError, type Backend, getBackend } from "./backend/index.js";
+import { colors, printError, printWarning } from "./branding.js";
 import type { Mem0Config } from "./config.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, saveConfig } from "./config.js";
 import { richFormatHelp } from "./help.js";
+import { setAgentMode } from "./state.js";
+import { captureEvent } from "./telemetry.js";
 import { CLI_VERSION } from "./version.js";
 
 const program = new Command();
 
+// ── Validated user identity (set by getBackendAndConfig) ─────────────────
+
+let _validatedUserEmail: string | undefined;
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-function getBackendAndConfig(
+async function getBackendAndConfig(
 	apiKey?: string,
 	baseUrl?: string,
-): { backend: Backend; config: Mem0Config } {
+): Promise<{ backend: Backend; config: Mem0Config }> {
 	const config = loadConfig();
 
 	if (apiKey) config.platform.apiKey = apiKey;
@@ -36,11 +42,58 @@ function getBackendAndConfig(
 		process.exit(1);
 	}
 
-	return { backend: getBackend(config), config };
+	const backend = getBackend(config);
+
+	// Validate the API key upfront with a fast timeout
+	try {
+		const pingData = (await Promise.race([
+			backend.ping(),
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error("timeout")), 5000),
+			),
+		])) as Record<string, unknown>;
+
+		const email = pingData?.user_email as string | undefined;
+		if (email) {
+			_validatedUserEmail = email;
+			if (config.platform.userEmail !== email) {
+				config.platform.userEmail = email;
+				try {
+					saveConfig(config);
+				} catch {
+					/* ignore */
+				}
+			}
+		}
+	} catch (e) {
+		if (e instanceof AuthError) {
+			printError(
+				"Invalid or expired API key.",
+				"Run 'mem0 init' or set MEM0_API_KEY environment variable.",
+			);
+			process.exit(1);
+		}
+		// Network error / timeout — warn but proceed
+		printWarning(
+			"Could not validate API key (network issue). Proceeding anyway.",
+		);
+	}
+
+	return { backend, config };
 }
 
-function getBackendOnly(apiKey?: string, baseUrl?: string): Backend {
-	return getBackendAndConfig(apiKey, baseUrl).backend;
+async function getBackendOnly(
+	apiKey?: string,
+	baseUrl?: string,
+): Promise<Backend> {
+	return (await getBackendAndConfig(apiKey, baseUrl)).backend;
+}
+
+function checkAgentMode(): boolean {
+	const rootOpts = program.opts();
+	const isAgent = !!(rootOpts.json || rootOpts.agent);
+	if (isAgent) setAgentMode(true);
+	return isAgent;
 }
 
 /**
@@ -105,18 +158,45 @@ program
 		console.log(`  ${colors.brand("◆ Mem0")} CLI v${CLI_VERSION}`);
 		process.exit(0);
 	})
+	.option("--json", "Output as JSON for agent/programmatic use.")
+	.option(
+		"--agent",
+		"Output as JSON for agent/programmatic use. (alias: --json)",
+	)
 	.usage("<command> [options]")
 	.helpOption("--help", "Show this message and exit.")
 	.addHelpCommand(false)
 	.configureHelp({ formatHelp: richFormatHelp });
 
+// ── Telemetry hook ───────────────────────────────────────────────────────
+
+program.hook("preAction", (_thisCommand, actionCommand) => {
+	try {
+		const commandName = actionCommand.name();
+		const parentName = actionCommand.parent?.name();
+		const fullCommand =
+			parentName && parentName !== "mem0"
+				? `${parentName}.${commandName}`
+				: commandName;
+		const isAgent = !!(program.opts().json || program.opts().agent);
+		captureEvent(
+			`cli.${fullCommand}`,
+			{
+				command: fullCommand,
+				is_agent: isAgent,
+			},
+			_validatedUserEmail,
+		);
+	} catch {
+		/* silently swallow */
+	}
+});
+
 // ── Init ──────────────────────────────────────────────────────────────────
 
 program
 	.command("init")
-	.description(
-		"Setup wizard for mem0 CLI. Supports email login (--email) or manual API key (--api-key).",
-	)
+	.description("Interactive setup wizard for mem0 CLI.")
 	.option("--api-key <key>", "API key (skip prompt).")
 	.option("-u, --user-id <id>", "Default user ID (skip prompt).")
 	.option("--email <email>", "Login via email verification code.")
@@ -124,6 +204,7 @@ program
 		"--code <code>",
 		"Verification code (use with --email for non-interactive login).",
 	)
+	.option("--force", "Overwrite existing config without confirmation.", false)
 	.addHelpText(
 		"after",
 		"\nExamples:\n  $ mem0 init\n  $ mem0 init --api-key m0-xxx --user-id alice\n  $ mem0 init --email you@example.com\n  $ mem0 init --email you@example.com --code 123456",
@@ -135,6 +216,7 @@ program
 			userId: opts.userId,
 			email: opts.email,
 			code: opts.code,
+			force: opts.force,
 		});
 	});
 
@@ -165,17 +247,24 @@ program
 	)
 	.action(async (text, opts) => {
 		const { cmdAdd } = await import("./commands/memory.js");
-		const { backend, config } = getBackendAndConfig(opts.apiKey, opts.baseUrl);
+		const isAgent = checkAgentMode();
+		const { backend, config } = await getBackendAndConfig(
+			opts.apiKey,
+			opts.baseUrl,
+		);
 		const ids = resolveIds(config, opts);
 		const enableGraph = resolveGraph(config, opts);
-		await cmdAdd(backend, text, { ...ids, ...opts, enableGraph });
+		const output = isAgent ? "agent" : opts.output;
+		await cmdAdd(backend, text, { ...ids, ...opts, enableGraph, output });
 	});
 
 // ── Memory: search ────────────────────────────────────────────────────────
 
 program
 	.command("search [query]")
-	.description("Search memories by semantic query.")
+	.description(
+		"Query your memory store — semantic, keyword, or hybrid retrieval.",
+	)
 	.option("-u, --user-id <id>", "Filter by user.")
 	.option("--agent-id <id>", "Filter by agent.")
 	.option("--app-id <id>", "Filter by app.")
@@ -215,9 +304,14 @@ program
 			process.exit(1);
 		}
 		const { cmdSearch } = await import("./commands/memory.js");
-		const { backend, config } = getBackendAndConfig(opts.apiKey, opts.baseUrl);
+		const isAgent = checkAgentMode();
+		const { backend, config } = await getBackendAndConfig(
+			opts.apiKey,
+			opts.baseUrl,
+		);
 		const ids = resolveIds(config, opts);
 		const enableGraph = resolveGraph(config, opts);
+		const output = isAgent ? "agent" : opts.output;
 		await cmdSearch(backend, resolvedQuery, {
 			...ids,
 			topK: opts.topK,
@@ -227,7 +321,7 @@ program
 			filterJson: opts.filter,
 			fields: opts.fields,
 			enableGraph,
-			output: opts.output,
+			output,
 		});
 	});
 
@@ -245,8 +339,10 @@ program
 	)
 	.action(async (memoryId, opts) => {
 		const { cmdGet } = await import("./commands/memory.js");
-		const backend = getBackendOnly(opts.apiKey, opts.baseUrl);
-		await cmdGet(backend, memoryId, { output: opts.output });
+		const isAgent = checkAgentMode();
+		const backend = await getBackendOnly(opts.apiKey, opts.baseUrl);
+		const output = isAgent ? "agent" : opts.output;
+		await cmdGet(backend, memoryId, { output });
 	});
 
 // ── Memory: list ──────────────────────────────────────────────────────────
@@ -279,9 +375,14 @@ program
 	)
 	.action(async (opts) => {
 		const { cmdList } = await import("./commands/memory.js");
-		const { backend, config } = getBackendAndConfig(opts.apiKey, opts.baseUrl);
+		const isAgent = checkAgentMode();
+		const { backend, config } = await getBackendAndConfig(
+			opts.apiKey,
+			opts.baseUrl,
+		);
 		const ids = resolveIds(config, opts);
 		const enableGraph = resolveGraph(config, opts);
+		const output = isAgent ? "agent" : opts.output;
 		await cmdList(backend, {
 			...ids,
 			page: opts.page,
@@ -290,7 +391,7 @@ program
 			after: opts.after,
 			before: opts.before,
 			enableGraph,
-			output: opts.output,
+			output,
 		});
 	});
 
@@ -313,10 +414,12 @@ program
 			resolvedText = fs.readFileSync(0, "utf-8").trim();
 		}
 		const { cmdUpdate } = await import("./commands/memory.js");
-		const backend = getBackendOnly(opts.apiKey, opts.baseUrl);
+		const isAgent = checkAgentMode();
+		const backend = await getBackendOnly(opts.apiKey, opts.baseUrl);
+		const output = isAgent ? "agent" : opts.output;
 		await cmdUpdate(backend, memoryId, resolvedText, {
 			metadata: opts.metadata,
-			output: opts.output,
+			output,
 		});
 	});
 
@@ -352,6 +455,8 @@ program
 		].join("\n"),
 	)
 	.action(async (memoryId, opts) => {
+		const isAgent = checkAgentMode();
+		const output = isAgent ? "agent" : opts.output;
 		// ── Mutual-exclusion checks ──
 		if (memoryId && opts.all) {
 			printError("Cannot combine <memoryId> with --all. Use one or the other.");
@@ -380,9 +485,9 @@ program
 		// ── Dispatch: single memory ──
 		if (memoryId) {
 			const { cmdDelete } = await import("./commands/memory.js");
-			const backend = getBackendOnly(opts.apiKey, opts.baseUrl);
+			const backend = await getBackendOnly(opts.apiKey, opts.baseUrl);
 			await cmdDelete(backend, memoryId, {
-				output: opts.output,
+				output,
 				dryRun: opts.dryRun,
 				force: opts.force,
 			});
@@ -392,7 +497,7 @@ program
 		// ── Dispatch: --all ──
 		if (opts.all) {
 			const { cmdDeleteAll } = await import("./commands/memory.js");
-			const { backend, config } = getBackendAndConfig(
+			const { backend, config } = await getBackendAndConfig(
 				opts.apiKey,
 				opts.baseUrl,
 			);
@@ -409,7 +514,7 @@ program
 				dryRun: opts.dryRun,
 				all: opts.project,
 				...ids,
-				output: opts.output,
+				output,
 			});
 			return;
 		}
@@ -417,8 +522,8 @@ program
 		// ── Dispatch: --entity ──
 		if (opts.entity) {
 			const { cmdEntitiesDelete } = await import("./commands/entities.js");
-			const backend = getBackendOnly(opts.apiKey, opts.baseUrl);
-			await cmdEntitiesDelete(backend, opts);
+			const backend = await getBackendOnly(opts.apiKey, opts.baseUrl);
+			await cmdEntitiesDelete(backend, { ...opts, output });
 			return;
 		}
 	});
@@ -440,7 +545,9 @@ configCmd
 	)
 	.action(async (opts) => {
 		const { cmdConfigShow } = await import("./commands/config.js");
-		cmdConfigShow({ output: opts.output });
+		const isAgent = checkAgentMode();
+		const output = isAgent ? "agent" : opts.output;
+		cmdConfigShow({ output });
 	});
 
 configCmd
@@ -452,6 +559,7 @@ configCmd
 	)
 	.action(async (key) => {
 		const { cmdConfigGet } = await import("./commands/config.js");
+		checkAgentMode();
 		cmdConfigGet(key);
 	});
 
@@ -464,6 +572,7 @@ configCmd
 	)
 	.action(async (key, value) => {
 		const { cmdConfigSet } = await import("./commands/config.js");
+		checkAgentMode();
 		cmdConfigSet(key, value);
 	});
 
@@ -487,8 +596,10 @@ entityCmd
 	)
 	.action(async (entityType, opts) => {
 		const { cmdEntitiesList } = await import("./commands/entities.js");
-		const backend = getBackendOnly(opts.apiKey, opts.baseUrl);
-		await cmdEntitiesList(backend, entityType, { output: opts.output });
+		const isAgent = checkAgentMode();
+		const backend = await getBackendOnly(opts.apiKey, opts.baseUrl);
+		const output = isAgent ? "agent" : opts.output;
+		await cmdEntitiesList(backend, entityType, { output });
 	});
 
 entityCmd
@@ -509,8 +620,54 @@ entityCmd
 	)
 	.action(async (opts) => {
 		const { cmdEntitiesDelete } = await import("./commands/entities.js");
-		const backend = getBackendOnly(opts.apiKey, opts.baseUrl);
-		await cmdEntitiesDelete(backend, opts);
+		const isAgent = checkAgentMode();
+		const backend = await getBackendOnly(opts.apiKey, opts.baseUrl);
+		const output = isAgent ? "agent" : opts.output;
+		await cmdEntitiesDelete(backend, { ...opts, output });
+	});
+
+// ── Event subcommands ─────────────────────────────────────────────────────
+
+const eventCmd = program
+	.command("event")
+	.description("Inspect background processing events.")
+	.addHelpCommand(false)
+	.configureHelp({ formatHelp: richFormatHelp });
+
+eventCmd
+	.command("list")
+	.description("List recent background processing events.")
+	.option("-o, --output <format>", "Output: table, json.", "table")
+	.option("--api-key <key>", "Override API key.")
+	.option("--base-url <url>", "Override API base URL.")
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ mem0 event list\n  $ mem0 event list -o json",
+	)
+	.action(async (opts) => {
+		const { cmdEventList } = await import("./commands/events.js");
+		const isAgent = checkAgentMode();
+		const backend = await getBackendOnly(opts.apiKey, opts.baseUrl);
+		const output = isAgent ? "agent" : opts.output;
+		await cmdEventList(backend, { output });
+	});
+
+eventCmd
+	.command("status <eventId>")
+	.description("Check the status of a specific background event.")
+	.option("-o, --output <format>", "Output: text, json.", "text")
+	.option("--api-key <key>", "Override API key.")
+	.option("--base-url <url>", "Override API base URL.")
+	.addHelpText(
+		"after",
+		"\nExamples:\n  $ mem0 event status <event-id>\n  $ mem0 event status <event-id> -o json",
+	)
+	.action(async (eventId, opts) => {
+		const { cmdEventStatus } = await import("./commands/events.js");
+		const isAgent = checkAgentMode();
+		const backend = await getBackendOnly(opts.apiKey, opts.baseUrl);
+		const output = isAgent ? "agent" : opts.output;
+		await cmdEventStatus(backend, eventId, { output });
 	});
 
 // ── Utility commands ──────────────────────────────────────────────────────
@@ -524,11 +681,16 @@ program
 	.addHelpText("after", "\nExamples:\n  $ mem0 status\n  $ mem0 status -o json")
 	.action(async (opts) => {
 		const { cmdStatus } = await import("./commands/utils.js");
-		const { backend, config } = getBackendAndConfig(opts.apiKey, opts.baseUrl);
+		const isAgent = checkAgentMode();
+		const { backend, config } = await getBackendAndConfig(
+			opts.apiKey,
+			opts.baseUrl,
+		);
+		const output = isAgent ? "agent" : opts.output;
 		await cmdStatus(backend, {
 			userId: config.defaults.userId || undefined,
 			agentId: config.defaults.agentId || undefined,
-			output: opts.output,
+			output,
 		});
 	});
 
@@ -546,12 +708,17 @@ program
 	)
 	.action(async (filePath, opts) => {
 		const { cmdImport } = await import("./commands/utils.js");
-		const { backend, config } = getBackendAndConfig(opts.apiKey, opts.baseUrl);
+		const isAgent = checkAgentMode();
+		const { backend, config } = await getBackendAndConfig(
+			opts.apiKey,
+			opts.baseUrl,
+		);
 		const ids = resolveIds(config, opts);
+		const output = isAgent ? "agent" : opts.output;
 		await cmdImport(backend, filePath, {
 			userId: ids.userId,
 			agentId: ids.agentId,
-			output: opts.output,
+			output,
 		});
 	});
 
@@ -565,7 +732,9 @@ program
 	.option("--json", "Output machine-readable JSON for LLM agents.", false)
 	.addHelpText("after", "\nExamples:\n  $ mem0 help\n  $ mem0 help --json")
 	.action((opts) => {
-		if (opts.json) {
+		// opts.json is set when `mem0 help --json` is used (subcommand flag).
+		// program.opts().json is set when the root --json global flag was used first.
+		if (opts.json || program.opts().json) {
 			// Load spec from parent directory
 			const __dirname = path.dirname(fileURLToPath(import.meta.url));
 			const specPath = path.join(__dirname, "..", "..", "cli-spec.json");
@@ -595,7 +764,9 @@ program
 			console.log(
 				"  add              Add a memory from text, messages, file, or stdin",
 			);
-			console.log("  search           Search memories by semantic query");
+			console.log(
+				"  search           Query your memory store (semantic, keyword, hybrid)",
+			);
 			console.log("  get              Get a specific memory by ID");
 			console.log("  list             List memories with optional filters");
 			console.log("  update           Update a memory's text or metadata");
@@ -605,6 +776,9 @@ program
 			console.log("  import           Import memories from a JSON file");
 			console.log("  config           Manage configuration (show, get, set)");
 			console.log("  entity           Manage entities (list, delete)");
+			console.log(
+				"  event            Inspect background events (list, status)",
+			);
 			console.log("  init             Interactive setup wizard");
 			console.log("  status           Check connectivity and authentication");
 			console.log();
@@ -614,16 +788,6 @@ program
 			);
 			console.log();
 		}
-	});
-
-// ── Version ───────────────────────────────────────────────────────────────
-
-program
-	.command("version")
-	.description("Show version.")
-	.action(async () => {
-		const { cmdVersion } = await import("./commands/utils.js");
-		cmdVersion();
 	});
 
 // ── Entrypoint ────────────────────────────────────────────────────────────
