@@ -477,21 +477,16 @@ function registerHooks(
         return;
       }
 
-      // Skip recall for system/bootstrap prompts. These are OpenClaw internal
-      // commands (/new, /reset) that contain system instructions, not user queries.
-      // Sending them to mem0 search wastes API calls and returns noise.
       const promptLower = event.prompt.toLowerCase();
       const isSystemPrompt =
         promptLower.includes("a new session was started") ||
         promptLower.includes("session startup sequence") ||
         promptLower.includes("/new or /reset") ||
-        promptLower.startsWith("system:") ||
         promptLower.startsWith("run your session");
       if (isSystemPrompt) {
         api.logger.info(
           "openclaw-mem0: skills-mode skipping recall for system/bootstrap prompt",
         );
-        // Still inject the protocol, just skip recall search
         const systemContext = loadTriagePrompt(cfg.skills ?? {});
         return { prependSystemContext: systemContext };
       }
@@ -737,13 +732,11 @@ function registerHooks(
         return;
       }
 
-      // Skip recall for system/bootstrap prompts to save API calls
       const promptLower = event.prompt.toLowerCase();
       const isSystemPrompt =
         promptLower.includes("a new session was started") ||
         promptLower.includes("session startup sequence") ||
         promptLower.includes("/new or /reset") ||
-        promptLower.startsWith("system:") ||
         promptLower.startsWith("run your session");
       if (isSystemPrompt) {
         api.logger.info(
