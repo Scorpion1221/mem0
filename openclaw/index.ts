@@ -91,11 +91,6 @@ export { createProvider } from "./providers.ts";
 // Helpers
 // ============================================================================
 
-type LastTurn = {
-  userMessage: string;
-  assistantReply: string;
-};
-
 type InjectionState = {
   ids: Set<string>;
   turnsSinceRefresh: number;
@@ -103,100 +98,8 @@ type InjectionState = {
 
 const DECAY_RATE = 0.2;
 
-function buildRecallQuery(
-  currentPrompt: string,
-  lastTurn: LastTurn | null,
-): string {
-  const cleanPrompt = stripNoiseFromContent(currentPrompt);
-  if (cleanPrompt.length >= 80 || !lastTurn) return cleanPrompt;
-
-  const parts: string[] = [];
-  if (lastTurn.userMessage) {
-    parts.push(lastTurn.userMessage);
-  }
-  if (
-    lastTurn.assistantReply &&
-    lastTurn.assistantReply.length >= 10 &&
-    !/^(ok|got it|sure|is there anything|how can i help|understood|done)/i.test(
-      lastTurn.assistantReply,
-    )
-  ) {
-    parts.push(lastTurn.assistantReply);
-  }
-  parts.push(cleanPrompt);
-  return parts.join("\n");
-}
-
-function extractMessageText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-
-  let text = "";
-  for (const block of content) {
-    if (
-      block &&
-      typeof block === "object" &&
-      "text" in block &&
-      typeof (block as Record<string, unknown>).text === "string"
-    ) {
-      text +=
-        (text ? "\n" : "") + ((block as Record<string, unknown>).text as string);
-    }
-  }
-  return text;
-}
-
-function cacheLastTurnForSession(
-  sessionId: string | undefined,
-  messages: unknown,
-  cache: Map<string, LastTurn>,
-  api: OpenClawPluginApi,
-): void {
-  if (!sessionId || !Array.isArray(messages)) return;
-
-  let lastUserMessage = "";
-  let lastAssistantReply = "";
-
-  for (const rawMessage of messages) {
-    if (!rawMessage || typeof rawMessage !== "object") continue;
-    const message = rawMessage as Record<string, unknown>;
-    const role = message.role;
-    if (role !== "user" && role !== "assistant") continue;
-
-    let text = extractMessageText(message.content);
-    if (!text) continue;
-
-    text = text
-      .replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g, "")
-      .replace(/<recalled-memories>[\s\S]*?<\/recalled-memories>\s*/g, "")
-      .trim();
-    if (!text) continue;
-
-    const cleaned = stripNoiseFromContent(text);
-    if (!cleaned) continue;
-
-    if (role === "user") {
-      lastUserMessage = cleaned.slice(0, 500);
-    } else {
-      lastAssistantReply = cleaned.slice(-300);
-    }
-  }
-
-  if (!lastUserMessage || !lastAssistantReply) return;
-
-  cache.set(sessionId, {
-    userMessage: lastUserMessage,
-    assistantReply: lastAssistantReply,
-  });
-
-  if (cache.size > 50) {
-    const oldestKey = cache.keys().next().value;
-    if (oldestKey) cache.delete(oldestKey);
-  }
-
-  api.logger.info(
-    `openclaw-mem0: cached last turn for session ${sessionId.slice(-20)} (user: ${lastUserMessage.length} chars, assistant: ${lastAssistantReply.length} chars)`,
-  );
+function buildRecallQuery(currentPrompt: string): string {
+  return stripNoiseFromContent(currentPrompt);
 }
 
 function formatMemoryLine(memory: MemoryItem): string {
@@ -552,7 +455,6 @@ function registerHooks(
   skillsActive: boolean = false,
   _captureEvent: (event: string, props?: Record<string, unknown>) => void = () => {},
 ) {
-  const lastTurnBySession = new Map<string, LastTurn>();
   const injectedBySession = new Map<string, InjectionState>();
 
   // ========================================================================
@@ -563,8 +465,6 @@ function registerHooks(
     // - prependSystemContext: static memory protocol (provider-cacheable, no per-turn cost)
     // - prependContext: dynamic recalled memories (changes every turn)
     //
-    // Recall query building must stay session-scoped because last-turn context
-    // is keyed by session to avoid cross-channel contamination.
     api.on("before_prompt_build", async (event: any, ctx: any) => {
       if (!event.prompt || event.prompt.length < 5) return;
 
@@ -621,10 +521,7 @@ function registerHooks(
       if (recallEnabled && recallStrategy !== "manual") {
         const recallStart = Date.now();
         try {
-          const lastTurn = sessionId
-            ? lastTurnBySession.get(sessionId) ?? null
-            : null;
-          const query = buildRecallQuery(event.prompt, lastTurn);
+          const query = buildRecallQuery(event.prompt);
 
           // Smart mode: skip session search (saves 1 API call per turn)
           const sessionIdForRecall =
@@ -643,13 +540,12 @@ function registerHooks(
           );
 
           api.logger.info(
-            `openclaw-mem0: skills-mode recall (strategy=${recallStrategy}, hasContext=${lastTurn != null}) injecting ${recallResult.memories.length} memories (~${recallResult.tokenEstimate} tokens)`,
+            `openclaw-mem0: skills-mode recall (strategy=${recallStrategy}) injecting ${recallResult.memories.length} memories (~${recallResult.tokenEstimate} tokens)`,
           );
 
           _captureEvent("openclaw.hook.recall", {
             strategy: recallStrategy,
             memory_count: recallResult.memories.length,
-            has_context: lastTurn != null,
             latency_ms: Date.now() - recallStart,
           });
 
@@ -744,14 +640,6 @@ function registerHooks(
       const sessionId = ctx?.sessionKey ?? undefined;
       const trigger = ctx?.trigger ?? undefined;
       if (sessionId) session.setCurrentSessionId(sessionId);
-      if (event.success) {
-        cacheLastTurnForSession(
-          sessionId,
-          event.messages,
-          lastTurnBySession,
-          api,
-        );
-      }
 
       // If dream was triggered for THIS session, handle cleanup regardless
       // of success/failure. A failed turn must still release the lock.
@@ -877,10 +765,7 @@ function registerHooks(
       // the user's long-term context.
       const isSubagent = isSubagentSession(sessionId);
       const recallSessionKey = isSubagent ? undefined : sessionId;
-      const lastTurn = sessionId
-        ? lastTurnBySession.get(sessionId) ?? null
-        : null;
-      const searchQuery = buildRecallQuery(event.prompt, lastTurn);
+      const searchQuery = buildRecallQuery(event.prompt);
 
       const recallStart = Date.now();
       const recallWork = async () => {
@@ -1029,12 +914,11 @@ function registerHooks(
           memory_count: allResults.length,
           new_count: newMemories.length,
           repeat_count: repeatMemories.length,
-          has_context: lastTurn != null,
           latency_ms: Date.now() - recallStart,
         });
 
         api.logger.info(
-          `openclaw-mem0: recall query (${searchQuery.length} chars, hasContext=${lastTurn != null}) injected ${allResults.length} memories (${newMemories.length} new, ${repeatMemories.length} repeat, ${isFullRefresh ? "FULL" : "DIFF"})`,
+          `openclaw-mem0: recall query (${searchQuery.length} chars) injected ${allResults.length} memories (${newMemories.length} new, ${repeatMemories.length} repeat, ${isFullRefresh ? "FULL" : "DIFF"})`,
         );
 
         const preamble = isSubagent
@@ -1095,7 +979,6 @@ function registerHooks(
 
       // Update shared state for tools (best-effort — tools don't have ctx)
       if (sessionId) session.setCurrentSessionId(sessionId);
-      cacheLastTurnForSession(sessionId, event.messages, lastTurnBySession, api);
 
       const MEMORY_MUTATE_TOOLS = new Set(["memory_add", "memory_update", "memory_delete"]);
       const agentUsedMemoryTool = event.messages.some((msg: any) => {
