@@ -334,6 +334,7 @@ const memoryPlugin = definePluginEntry({
       limit?: number,
       runId?: string,
       sessionKey?: string,
+      reranking?: boolean,
     ): SearchOptions {
       const recallCfg = cfg.skills?.recall;
       const opts: SearchOptions = {
@@ -342,7 +343,7 @@ const memoryPlugin = definePluginEntry({
         limit: limit ?? cfg.topK,
         threshold: recallCfg?.threshold ?? cfg.searchThreshold,
         keyword_search: recallCfg?.keywordSearch !== false,
-        reranking: recallCfg?.rerank !== false,
+        reranking: reranking ?? (recallCfg?.rerank !== false),
         source: "OPENCLAW",
       };
       if (recallCfg?.filterMemories) opts.filter_memories = true;
@@ -769,6 +770,7 @@ function registerHooks(
           5,
           undefined,
           recallSessionKey,
+          false,
         );
         broadOpts.threshold = 0.5;
 
@@ -796,6 +798,7 @@ function registerHooks(
                   undefined,
                   sessionId,
                   recallSessionKey,
+                  false,
                 ),
               )
             : Promise.resolve([] as MemoryItem[]),
