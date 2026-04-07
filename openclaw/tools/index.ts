@@ -20,7 +20,13 @@ export interface ToolDeps {
   effectiveUserId: (sessionKey?: string) => string;
   agentUserId: (id: string) => string;
   buildAddOptions: (userIdOverride?: string, runId?: string, sessionKey?: string) => AddOptions;
-  buildSearchOptions: (userIdOverride?: string, limit?: number, runId?: string, sessionKey?: string) => SearchOptions;
+  buildSearchOptions: (
+    userIdOverride?: string,
+    limit?: number,
+    runId?: string,
+    sessionKey?: string,
+    reranking?: boolean,
+  ) => SearchOptions;
   getCurrentSessionId: () => string | undefined;
   skillsActive: boolean;
   captureToolEvent: (toolName: string, properties: Record<string, unknown>) => void;

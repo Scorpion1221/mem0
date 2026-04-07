@@ -239,6 +239,7 @@ export function registerCliCommands(
     limit?: number,
     runId?: string,
     sessionKey?: string,
+    reranking?: boolean,
   ) => SearchOptions,
   getCurrentSessionId: () => string | undefined,
   captureCliEvent?: (command: string) => void,

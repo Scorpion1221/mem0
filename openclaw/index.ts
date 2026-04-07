@@ -448,6 +448,7 @@ function registerHooks(
     limit?: number,
     runId?: string,
     sessionKey?: string,
+    reranking?: boolean,
   ) => SearchOptions,
   session: {
     setCurrentSessionId: (id: string) => void;
