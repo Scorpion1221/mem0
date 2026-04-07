@@ -529,6 +529,7 @@ class SelfHostedProvider implements Mem0Provider {
     if (options.top_k != null) payload.limit = options.top_k;
     if (options.limit != null) payload.limit = options.limit;
     if (options.threshold != null) payload.threshold = options.threshold;
+    if (options.reranking != null) payload.reranking = options.reranking;
     if (Object.keys(filters).length > 0) payload.filters = filters;
 
     const result = await this.request("/search", {
