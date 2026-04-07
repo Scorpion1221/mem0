@@ -1,6 +1,20 @@
 {
   "id": "openclaw-mem0",
+  "name": "Memory (Mem0)",
+  "description": "Mem0 memory backend for OpenClaw — platform or self-hosted open-source",
   "kind": "memory",
+  "skills": ["skills"],
+  "contracts": {
+    "tools": [
+      "memory_search", "memory_add", "memory_get", "memory_list",
+      "memory_update", "memory_delete", "memory_event_list", "memory_event_status"
+    ]
+  },
+  "providerAuthEnvVars": {
+    "mem0": ["MEM0_API_KEY"],
+    "mem0-oss-openai": ["OPENAI_API_KEY"],
+    "mem0-oss-anthropic": ["ANTHROPIC_API_KEY"]
+  },
   "uiHints": {
     "mode": {
       "label": "Mode",
@@ -10,7 +24,7 @@
       "label": "Mem0 API Key",
       "sensitive": true,
       "placeholder": "m0-...",
-      "help": "API key from app.mem0.ai (or use ${MEM0_API_KEY}). Only needed for platform mode."
+      "help": "Platform mode only. Use a SecretRef ({\"source\":\"env\",\"provider\":\"default\",\"id\":\"MEM0_API_KEY\"}) or ${MEM0_API_KEY} instead of storing the key directly."
     },
     "host": {
       "label": "Mem0 Host URL",
@@ -73,7 +87,12 @@
     "oss": {
       "label": "Open-Source Configuration",
       "advanced": true,
-      "help": "Optional. Configure custom embedder, vector store, LLM, or history DB for open-source mode. Has sensible defaults — only override what you need."
+      "help": "Optional. Configure custom embedder, vector store, LLM, or history DB for open-source mode. For API keys in sub-provider configs, use SecretRef objects or ${VAR} syntax instead of plaintext values."
+    },
+    "skills": {
+      "label": "Agentic Memory Skills",
+      "advanced": true,
+      "help": "Enable skills-based memory extraction. The agent controls what to remember (triage), how to recall (recall), and periodic cleanup (dream). Disables auto-capture when active."
     }
   },
   "configSchema": {
@@ -84,8 +103,7 @@
         "type": "string",
         "enum": [
           "platform",
-          "open-source",
-          "oss"
+          "open-source"
         ]
       },
       "apiKey": {
@@ -95,6 +113,9 @@
         "type": "string"
       },
       "userId": {
+        "type": "string"
+      },
+      "userEmail": {
         "type": "string"
       },
       "orgId": {
@@ -169,6 +190,54 @@
           "historyDbPath": {
             "type": "string"
           }
+        }
+      },
+      "skills": {
+        "type": "object",
+        "properties": {
+          "triage": {
+            "type": "object",
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "importanceThreshold": { "type": "number" },
+              "enableGraph": { "type": "boolean" },
+              "credentialPatterns": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "recall": {
+            "type": "object",
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "strategy": { "type": "string", "enum": ["always", "smart", "manual"] },
+              "tokenBudget": { "type": "number" },
+              "maxMemories": { "type": "number" },
+              "rerank": { "type": "boolean" },
+              "keywordSearch": { "type": "boolean" },
+              "filterMemories": { "type": "boolean" },
+              "threshold": { "type": "number" },
+              "identityAlwaysInclude": { "type": "boolean" },
+              "categoryOrder": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "dream": {
+            "type": "object",
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "auto": { "type": "boolean" },
+              "minHours": { "type": "number" },
+              "minSessions": { "type": "number" },
+              "minMemories": { "type": "number" }
+            }
+          },
+          "domain": { "type": "string" },
+          "customRules": {
+            "type": "object",
+            "properties": {
+              "include": { "type": "array", "items": { "type": "string" } },
+              "exclude": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "categories": { "type": "object" }
         }
       }
     },

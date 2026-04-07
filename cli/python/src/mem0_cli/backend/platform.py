@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from mem0_cli import __version__
 from mem0_cli.backend.base import Backend
 from mem0_cli.config import PlatformConfig
 
@@ -21,11 +22,17 @@ class PlatformBackend(Backend):
             headers={
                 "Authorization": f"Token {config.api_key}",
                 "Content-Type": "application/json",
+                "X-Mem0-Source": "cli",
+                "X-Mem0-Client-Language": "python",
+                "X-Mem0-Client-Version": __version__,
             },
             timeout=30.0,
         )
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        from mem0_cli.state import is_agent_mode
+
+        self._client.headers["X-Mem0-Caller-Type"] = "agent" if is_agent_mode() else "user"
         resp = self._client.request(method, path, **kwargs)
         if resp.status_code == 401:
             raise AuthError("Authentication failed. Your API key may be invalid or expired.")
@@ -265,18 +272,35 @@ class PlatformBackend(Backend):
         app_id: str | None = None,
         run_id: str | None = None,
     ) -> dict:
-        params: dict[str, str] = {}
-        if user_id:
-            params["user_id"] = user_id
-        if agent_id:
-            params["agent_id"] = agent_id
-        if app_id:
-            params["app_id"] = app_id
-        if run_id:
-            params["run_id"] = run_id
-        if not params:
+        # v2 endpoint: DELETE /v2/entities/{entity_type}/{entity_id}/
+        type_map = {
+            "user": user_id,
+            "agent": agent_id,
+            "app": app_id,
+            "run": run_id,
+        }
+        entities = {t: v for t, v in type_map.items() if v}
+        if not entities:
             raise ValueError("At least one entity ID is required for delete_entities.")
-        return self._request("DELETE", "/v1/entities/", params=params)
+        # Delete each provided entity via the v2 path-based endpoint
+        result: dict = {}
+        for entity_type, entity_id in entities.items():
+            result = self._request("DELETE", f"/v2/entities/{entity_type}/{entity_id}/")
+        return result
+
+    def ping(self, timeout: float | None = None) -> dict:
+        """Call the ping endpoint and return the raw response.
+
+        When *timeout* is given it overrides the client-level timeout so that
+        validation pings can fail fast without blocking the user.
+        """
+        if timeout is not None:
+            resp = self._client.get("/v1/ping/", timeout=timeout)
+            if resp.status_code == 401:
+                raise AuthError("Authentication failed. Your API key may be invalid or expired.")
+            resp.raise_for_status()
+            return resp.json()
+        return self._request("GET", "/v1/ping/")
 
     def status(
         self,
@@ -284,19 +308,9 @@ class PlatformBackend(Backend):
         user_id: str | None = None,
         agent_id: str | None = None,
     ) -> dict[str, Any]:
-        """Check connectivity by making a lightweight API call."""
+        """Check connectivity using the ping endpoint."""
         try:
-            # If entity IDs are available, validate with a minimal memories list
-            if user_id or agent_id:
-                payload: dict[str, Any] = {}
-                params = {"page": "1", "page_size": "1"}
-                api_filters = self._build_filters(user_id=user_id, agent_id=agent_id)
-                if api_filters:
-                    payload["filters"] = api_filters
-                self._request("POST", "/v2/memories/", json=payload, params=params)
-            else:
-                # No entity IDs — use entities endpoint to validate API key
-                self._request("GET", "/v1/entities/")
+            self.ping()
             return {"connected": True, "backend": "platform", "base_url": self.base_url}
         except Exception as e:
             return {"connected": False, "backend": "platform", "error": str(e)}
@@ -310,6 +324,13 @@ class PlatformBackend(Backend):
         if target_type:
             items = [e for e in items if e.get("type", "").lower() == target_type]
         return items
+
+    def list_events(self) -> list[dict]:
+        result = self._request("GET", "/v1/events/")
+        return result if isinstance(result, list) else result.get("results", [])
+
+    def get_event(self, event_id: str) -> dict:
+        return self._request("GET", f"/v1/event/{event_id}/")
 
 
 class AuthError(Exception):

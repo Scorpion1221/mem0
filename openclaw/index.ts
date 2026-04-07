@@ -5,18 +5,18 @@
  * and the open-source self-hosted SDK. Uses the official `mem0ai` package.
  *
  * Features:
- * - 5 tools: memory_search, memory_list, memory_store, memory_get, memory_forget
- *   (with session/long-term scope support via scope and longTerm parameters)
+ * - 6 core tools: memory_search, memory_add, memory_get, memory_list,
+ *   memory_update, memory_delete
  * - Short-term (session-scoped) and long-term (user-scoped) memory
  * - Auto-recall: injects relevant memories (both scopes) before each agent turn
  * - Auto-capture: stores key facts scoped to the current session after each agent turn
  * - Per-agent isolation: multi-agent setups write/read from separate userId namespaces
  *   automatically via sessionKey routing (zero breaking changes for single-agent setups)
- * - CLI: openclaw mem0 search, openclaw mem0 stats
+ * - CLI: openclaw mem0 search, openclaw mem0 status
  * - Dual mode: platform or open-source (self-hosted)
  */
 
-import { Type } from "@sinclair/typebox";
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
 import type {
@@ -26,8 +26,9 @@ import type {
   AddOptions,
   SearchOptions,
 } from "./types.ts";
-import { createProvider } from "./providers.ts";
+import { createProvider, providerToBackend } from "./providers.ts";
 import { mem0ConfigSchema } from "./config.ts";
+import type { FileConfig } from "./config.ts";
 import {
   filterMessagesForExtraction,
   stripNoiseFromContent,
@@ -39,12 +40,43 @@ import {
   isNonInteractiveTrigger,
   isSubagentSession,
 } from "./isolation.ts";
+import {
+  loadTriagePrompt,
+  loadDreamPrompt,
+  isSkillsMode,
+} from "./skill-loader.ts";
+import { recall as skillRecall } from "./recall.ts";
+import {
+  incrementSessionCount,
+  checkCheapGates,
+  checkMemoryGate,
+  acquireDreamLock,
+  releaseDreamLock,
+  recordDreamCompletion,
+} from "./dream-gate.ts";
+import { PlatformBackend } from "./backend/platform.ts";
+import type { Backend } from "./backend/base.ts";
+import { registerCliCommands } from "./cli/commands.ts";
+import { readPluginAuth } from "./cli/config-file.ts";
+import { registerAllTools } from "./tools/index.ts";
+import type { ToolDeps } from "./tools/index.ts";
+import { captureEvent } from "./telemetry.ts";
+import { bootstrapTelemetryFlag } from "./fs-safe.ts";
+
+bootstrapTelemetryFlag();
 
 // ============================================================================
 // Re-exports (for tests and external consumers)
 // ============================================================================
 
-export { extractAgentId, effectiveUserId, agentUserId, resolveUserId, isNonInteractiveTrigger, isSubagentSession } from "./isolation.ts";
+export {
+  extractAgentId,
+  effectiveUserId,
+  agentUserId,
+  resolveUserId,
+  isNonInteractiveTrigger,
+  isSubagentSession,
+} from "./isolation.ts";
 export {
   isNoiseMessage,
   isGenericAssistantMessage,
@@ -52,40 +84,305 @@ export {
   filterMessagesForExtraction,
 } from "./filtering.ts";
 export { mem0ConfigSchema } from "./config.ts";
+export type { FileConfig } from "./config.ts";
 export { createProvider } from "./providers.ts";
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-/** Convert Record<string, string> categories to the array format mem0ai expects */
+type LastTurn = {
+  userMessage: string;
+  assistantReply: string;
+};
+
+type InjectionState = {
+  ids: Set<string>;
+  turnsSinceRefresh: number;
+};
+
+const DECAY_RATE = 0.2;
+
+function buildRecallQuery(
+  currentPrompt: string,
+  lastTurn: LastTurn | null,
+): string {
+  const cleanPrompt = stripNoiseFromContent(currentPrompt);
+  if (cleanPrompt.length >= 80 || !lastTurn) return cleanPrompt;
+
+  const parts: string[] = [];
+  if (lastTurn.userMessage) {
+    parts.push(lastTurn.userMessage);
+  }
+  if (
+    lastTurn.assistantReply &&
+    lastTurn.assistantReply.length >= 10 &&
+    !/^(ok|got it|sure|is there anything|how can i help|understood|done)/i.test(
+      lastTurn.assistantReply,
+    )
+  ) {
+    parts.push(lastTurn.assistantReply);
+  }
+  parts.push(cleanPrompt);
+  return parts.join("\n");
+}
+
+function extractMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  let text = "";
+  for (const block of content) {
+    if (
+      block &&
+      typeof block === "object" &&
+      "text" in block &&
+      typeof (block as Record<string, unknown>).text === "string"
+    ) {
+      text +=
+        (text ? "\n" : "") + ((block as Record<string, unknown>).text as string);
+    }
+  }
+  return text;
+}
+
+function cacheLastTurnForSession(
+  sessionId: string | undefined,
+  messages: unknown,
+  cache: Map<string, LastTurn>,
+  api: OpenClawPluginApi,
+): void {
+  if (!sessionId || !Array.isArray(messages)) return;
+
+  let lastUserMessage = "";
+  let lastAssistantReply = "";
+
+  for (const rawMessage of messages) {
+    if (!rawMessage || typeof rawMessage !== "object") continue;
+    const message = rawMessage as Record<string, unknown>;
+    const role = message.role;
+    if (role !== "user" && role !== "assistant") continue;
+
+    let text = extractMessageText(message.content);
+    if (!text) continue;
+
+    text = text
+      .replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g, "")
+      .replace(/<recalled-memories>[\s\S]*?<\/recalled-memories>\s*/g, "")
+      .trim();
+    if (!text) continue;
+
+    const cleaned = stripNoiseFromContent(text);
+    if (!cleaned) continue;
+
+    if (role === "user") {
+      lastUserMessage = cleaned.slice(0, 500);
+    } else {
+      lastAssistantReply = cleaned.slice(-300);
+    }
+  }
+
+  if (!lastUserMessage || !lastAssistantReply) return;
+
+  cache.set(sessionId, {
+    userMessage: lastUserMessage,
+    assistantReply: lastAssistantReply,
+  });
+
+  if (cache.size > 50) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey) cache.delete(oldestKey);
+  }
+
+  api.logger.info(
+    `openclaw-mem0: cached last turn for session ${sessionId.slice(-20)} (user: ${lastUserMessage.length} chars, assistant: ${lastAssistantReply.length} chars)`,
+  );
+}
+
+function formatMemoryLine(memory: MemoryItem): string {
+  return `- ${memory.memory}${
+    memory.categories?.length ? ` [${memory.categories.join(", ")}]` : ""
+  }`;
+}
+
 function categoriesToArray(
-  cats: Record<string, string>,
+  categories: Record<string, string>,
 ): Array<Record<string, string>> {
-  return Object.entries(cats).map(([key, value]) => ({ [key]: value }));
+  return Object.entries(categories).map(([key, value]) => ({ [key]: value }));
+}
+
+function buildInjectedContext(
+  memories: MemoryItem[],
+  sessionId: string | undefined,
+  preamble: string,
+  cache: Map<string, InjectionState>,
+): {
+  context: string;
+  totalCount: number;
+  newCount: number;
+  repeatCount: number;
+  fullRefresh: boolean;
+  threshold: number;
+  turnsSinceRefresh: number;
+} {
+  if (memories.length === 0) {
+    return {
+      context: "",
+      totalCount: 0,
+      newCount: 0,
+      repeatCount: 0,
+      fullRefresh: true,
+      threshold: 1,
+      turnsSinceRefresh: 0,
+    };
+  }
+
+  if (!sessionId) {
+    const memoryContext = memories.map((memory) => formatMemoryLine(memory)).join("\n");
+    return {
+      context: `<relevant-memories>\n${preamble}\n${memoryContext}\n</relevant-memories>`,
+      totalCount: memories.length,
+      newCount: memories.length,
+      repeatCount: 0,
+      fullRefresh: true,
+      threshold: 1,
+      turnsSinceRefresh: 0,
+    };
+  }
+
+  const state = cache.get(sessionId) ?? {
+    ids: new Set<string>(),
+    turnsSinceRefresh: 0,
+  };
+  const newMemories = memories.filter((memory) => !state.ids.has(memory.id));
+  const repeatMemories = memories.filter((memory) => state.ids.has(memory.id));
+  const newRatio = memories.length > 0 ? newMemories.length / memories.length : 1;
+  const threshold = 0.8 * Math.exp(-DECAY_RATE * state.turnsSinceRefresh);
+  const fullRefresh = newRatio > threshold || state.ids.size === 0;
+
+  let memoryContext = "";
+  if (fullRefresh) {
+    memoryContext = memories.map((memory) => formatMemoryLine(memory)).join("\n");
+    state.turnsSinceRefresh = 0;
+  } else {
+    if (newMemories.length > 0) {
+      memoryContext +=
+        "New context:\n" +
+        newMemories.map((memory) => formatMemoryLine(memory)).join("\n");
+    }
+    if (repeatMemories.length > 0) {
+      if (memoryContext) memoryContext += "\n\n";
+      memoryContext +=
+        "Previously noted (still relevant):\n" +
+        repeatMemories
+          .map((memory) => {
+            const preview = `${memory.memory.slice(0, 60)}${
+              memory.memory.length > 60 ? "..." : ""
+            }`;
+            return `- ${preview}`;
+          })
+          .join("\n");
+    }
+    state.turnsSinceRefresh += 1;
+  }
+
+  for (const memory of memories) {
+    state.ids.add(memory.id);
+  }
+  cache.set(sessionId, state);
+
+  if (cache.size > 50) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey) cache.delete(oldestKey);
+  }
+
+  return {
+    context: `<relevant-memories>\n${preamble}\n${memoryContext}\n</relevant-memories>`,
+    totalCount: memories.length,
+    newCount: newMemories.length,
+    repeatCount: repeatMemories.length,
+    fullRefresh,
+    threshold,
+    turnsSinceRefresh: state.turnsSinceRefresh,
+  };
 }
 
 // ============================================================================
 // Plugin Definition
 // ============================================================================
 
-const memoryPlugin = {
+const memoryPlugin = definePluginEntry({
   id: "openclaw-mem0",
   name: "Memory (Mem0)",
-  description:
-    "Mem0 memory backend — Mem0 platform or self-hosted open-source",
-  kind: "memory" as const,
-  configSchema: mem0ConfigSchema,
+  description: "Mem0 memory backend — Mem0 platform or self-hosted open-source",
 
   register(api: OpenClawPluginApi) {
-    const cfg = mem0ConfigSchema.parse(api.pluginConfig);
+    // Read auth from openclaw.json plugin config (picks up post-startup login).
+    // This is the single source of truth — set via `openclaw mem0 login`.
+    const pluginAuth = readPluginAuth();
+    const fileConfig: FileConfig = {
+      apiKey: pluginAuth.apiKey,
+      baseUrl: pluginAuth.baseUrl,
+      orgId: pluginAuth.orgId,
+      projectId: pluginAuth.projectId,
+    };
+    const cfg = mem0ConfigSchema.parse(api.pluginConfig, fileConfig);
+
+    // Telemetry context bound to this plugin instance's config
+    const telemetryCtx = { apiKey: cfg.apiKey, mode: cfg.mode, skillsActive: false };
+    const _captureEvent = (event: string, props?: Record<string, unknown>) => {
+      try { captureEvent(event, props, telemetryCtx); } catch { /* silently swallow */ }
+    };
+
+    if (cfg.needsSetup) {
+      api.logger.warn(
+        "openclaw-mem0: API key not configured. Memory features are disabled.\n" +
+          "  To set up, run:\n" +
+          "  openclaw mem0 init\n" +
+          "  Get your key at: https://app.mem0.ai/dashboard/api-keys",
+      );
+
+      // Register CLI even without API key — init command must be available
+      // to bootstrap configuration. Pass nulls for backend/provider since
+      // only the init subcommand works without auth.
+      registerCliCommands(
+        api,
+        null as any,
+        null as any,
+        cfg,
+        () => cfg.userId,
+        (id: string) => `${cfg.userId}:agent:${id}`,
+        () => ({ user_id: cfg.userId, top_k: cfg.topK }),
+        () => undefined,
+        (cmd: string) => _captureEvent(`openclaw.${cmd}`, { command: cmd }),
+      );
+
+      api.registerService({
+        id: "openclaw-mem0",
+        start: () => {
+          api.logger.info("openclaw-mem0: waiting for API key configuration");
+        },
+        stop: () => {},
+      });
+      return;
+    }
+
     const provider = createProvider(cfg, api);
 
-    // Track current session ID for tool-level session scoping.
-    // NOTE: This is shared mutable state — tools don't receive ctx, so they
-    // read this as a best-effort fallback. Hooks should use ctx.sessionKey
-    // directly and avoid relying on this variable.
+    // Create Backend instance — PlatformBackend for platform mode, providerToBackend adapter for OSS
+    let backend: Backend;
+    if (cfg.mode === "platform" && !cfg.host) {
+      backend = new PlatformBackend({
+        apiKey: cfg.apiKey!,
+        baseUrl: cfg.baseUrl ?? "https://api.mem0.ai",
+      });
+    } else {
+      backend = providerToBackend(provider, cfg.userId);
+    }
+
+    // Shared mutable state — declared together before any closures capture them.
     let currentSessionId: string | undefined;
+    let pluginStateDir: string | undefined;
 
     // ========================================================================
     // Per-agent isolation helpers (thin wrappers around exported functions)
@@ -96,12 +393,24 @@ const memoryPlugin = {
     const _resolveUserId = (opts: { agentId?: string; userId?: string }) =>
       resolveUserId(cfg.userId, opts, currentSessionId);
 
+    const skillsActive = isSkillsMode(cfg.skills);
+    telemetryCtx.skillsActive = skillsActive;
+
+    _captureEvent("openclaw.plugin.registered", {
+      auto_recall: cfg.autoRecall,
+      auto_capture: cfg.autoCapture,
+    });
+
     api.logger.info(
-      `openclaw-mem0: registered (mode: ${cfg.mode}, user: ${cfg.userId}, graph: ${cfg.enableGraph}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture})`,
+      `openclaw-mem0: registered (mode: ${cfg.mode}, user: ${cfg.userId}, graph: ${cfg.enableGraph}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture}, skills: ${skillsActive})`,
     );
 
     // Helper: build add options
-    function buildAddOptions(userIdOverride?: string, runId?: string, sessionKey?: string): AddOptions {
+    function buildAddOptions(
+      userIdOverride?: string,
+      runId?: string,
+      sessionKey?: string,
+    ): AddOptions {
       const opts: AddOptions = {
         user_id: userIdOverride || _effectiveUserId(sessionKey),
         source: "OPENCLAW",
@@ -116,45 +425,86 @@ const memoryPlugin = {
       return opts;
     }
 
-    // Helper: build search options
+    // Helper: build search options (skills config overrides legacy defaults)
     function buildSearchOptions(
       userIdOverride?: string,
       limit?: number,
       runId?: string,
       sessionKey?: string,
     ): SearchOptions {
+      const recallCfg = cfg.skills?.recall;
       const opts: SearchOptions = {
         user_id: userIdOverride || _effectiveUserId(sessionKey),
         top_k: limit ?? cfg.topK,
         limit: limit ?? cfg.topK,
-        threshold: cfg.searchThreshold,
-        keyword_search: true,
-        reranking: true,
+        threshold: recallCfg?.threshold ?? cfg.searchThreshold,
+        keyword_search: recallCfg?.keywordSearch !== false,
+        reranking: recallCfg?.rerank !== false,
         source: "OPENCLAW",
       };
+      if (recallCfg?.filterMemories) opts.filter_memories = true;
       if (runId) opts.run_id = runId;
       return opts;
     }
 
     // ========================================================================
-    // Tools
+    // Tools (modular — each tool in its own file under tools/)
     // ========================================================================
 
-    registerTools(api, provider, cfg, _resolveUserId, _effectiveUserId, _agentUserId, buildAddOptions, buildSearchOptions, () => currentSessionId);
+    const toolDeps: ToolDeps = {
+      api,
+      provider,
+      cfg,
+      backend,
+      resolveUserId: _resolveUserId,
+      effectiveUserId: _effectiveUserId,
+      agentUserId: _agentUserId,
+      buildAddOptions,
+      buildSearchOptions,
+      getCurrentSessionId: () => currentSessionId,
+      skillsActive,
+      captureToolEvent: (toolName: string, props: Record<string, unknown>) => {
+        _captureEvent(`openclaw.tool.${toolName}`, { tool_name: toolName, ...props });
+      },
+    };
+    registerAllTools(toolDeps);
 
     // ========================================================================
     // CLI Commands
     // ========================================================================
 
-    registerCli(api, provider, cfg, _effectiveUserId, _agentUserId, buildSearchOptions, () => currentSessionId);
+    registerCliCommands(
+      api,
+      backend,
+      provider,
+      cfg,
+      _effectiveUserId,
+      _agentUserId,
+      buildSearchOptions,
+      () => currentSessionId,
+      (cmd: string) => _captureEvent(`openclaw.cli.${cmd}`, { command: cmd }),
+    );
 
     // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 
-    registerHooks(api, provider, cfg, _effectiveUserId, buildAddOptions, buildSearchOptions, {
-      setCurrentSessionId: (id: string) => { currentSessionId = id; },
-    });
+    registerHooks(
+      api,
+      provider,
+      cfg,
+      _effectiveUserId,
+      buildAddOptions,
+      buildSearchOptions,
+      {
+        setCurrentSessionId: (id: string) => {
+          currentSessionId = id;
+        },
+        getStateDir: () => pluginStateDir,
+      },
+      skillsActive,
+      _captureEvent,
+    );
 
     // ========================================================================
     // Service
@@ -162,9 +512,10 @@ const memoryPlugin = {
 
     api.registerService({
       id: "openclaw-mem0",
-      start: () => {
+      start: (...args: any[]) => {
+        pluginStateDir = args[0]?.stateDir;
         api.logger.info(
-          `openclaw-mem0: initialized (mode: ${cfg.mode}, user: ${cfg.userId}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture})`,
+          `openclaw-mem0: initialized (mode: ${cfg.mode}, user: ${cfg.userId}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture}, stateDir: ${pluginStateDir ?? "none"})`,
         );
       },
       stop: () => {
@@ -172,724 +523,7 @@ const memoryPlugin = {
       },
     });
   },
-};
-
-// ============================================================================
-// Tool Registration
-// ============================================================================
-
-function registerTools(
-  api: OpenClawPluginApi,
-  provider: Mem0Provider,
-  cfg: Mem0Config,
-  _resolveUserId: (opts: { agentId?: string; userId?: string }) => string,
-  _effectiveUserId: (sessionKey?: string) => string,
-  _agentUserId: (id: string) => string,
-  buildAddOptions: (userIdOverride?: string, runId?: string, sessionKey?: string) => AddOptions,
-  buildSearchOptions: (userIdOverride?: string, limit?: number, runId?: string, sessionKey?: string) => SearchOptions,
-  getCurrentSessionId: () => string | undefined,
-) {
-  api.registerTool(
-    {
-      name: "memory_search",
-      label: "Memory Search",
-      description:
-        "Search through long-term memories stored in Mem0. Use when you need context about user preferences, past decisions, or previously discussed topics. You can filter by categories like identity, preferences, goals, projects, technical, decisions, relationships, routines, etc.",
-      parameters: Type.Object({
-        query: Type.String({ description: "Search query" }),
-        limit: Type.Optional(
-          Type.Number({
-            description: `Max results (default: ${cfg.topK})`,
-          }),
-        ),
-        userId: Type.Optional(
-          Type.String({
-            description:
-              "User ID to scope search (default: configured userId)",
-          }),
-        ),
-        agentId: Type.Optional(
-          Type.String({
-            description:
-              "Agent ID to search memories for a specific agent (e.g. \"researcher\"). Overrides userId.",
-          }),
-        ),
-        categories: Type.Optional(
-          Type.Array(Type.String(), {
-            description:
-              'Filter by memory categories (e.g. ["identity", "projects"]). Only returns memories tagged with these categories.',
-          }),
-        ),
-        scope: Type.Optional(
-          Type.Union([
-            Type.Literal("session"),
-            Type.Literal("long-term"),
-            Type.Literal("all"),
-          ], {
-            description:
-              'Memory scope: "session" (current session only), "long-term" (user-scoped only), or "all" (both). Default: "all"',
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        const { query, limit, userId, agentId, categories, scope = "all" } = params as {
-          query: string;
-          limit?: number;
-          userId?: string;
-          agentId?: string;
-          categories?: string[];
-          scope?: "session" | "long-term" | "all";
-        };
-
-        try {
-          let results: MemoryItem[] = [];
-          const uid = _resolveUserId({ agentId, userId });
-          const currentSessionId = getCurrentSessionId();
-
-          // Build category filter if specified
-          const catFilter: Record<string, unknown> | undefined =
-            categories && categories.length > 0
-              ? categories.length === 1
-                ? { category: categories[0] }
-                : { category: { in: categories } }
-              : undefined;
-
-          const addFilters = (opts: SearchOptions): SearchOptions => {
-            if (catFilter) opts.filters = { ...opts.filters, ...catFilter };
-            return opts;
-          };
-
-          if (scope === "session") {
-            if (currentSessionId) {
-              results = await provider.search(
-                query,
-                addFilters(buildSearchOptions(uid, limit, currentSessionId)),
-              );
-            }
-          } else if (scope === "long-term") {
-            results = await provider.search(
-              query,
-              addFilters(buildSearchOptions(uid, limit)),
-            );
-          } else {
-            // "all" — search both scopes and combine
-            const longTermResults = await provider.search(
-              query,
-              addFilters(buildSearchOptions(uid, limit)),
-            );
-            let sessionResults: MemoryItem[] = [];
-            if (currentSessionId) {
-              sessionResults = await provider.search(
-                query,
-                addFilters(buildSearchOptions(uid, limit, currentSessionId)),
-              );
-            }
-            // Deduplicate by ID, preferring long-term
-            const seen = new Set(longTermResults.map((r) => r.id));
-            results = [
-              ...longTermResults,
-              ...sessionResults.filter((r) => !seen.has(r.id)),
-            ];
-          }
-
-          if (!results || results.length === 0) {
-            return {
-              content: [
-                { type: "text", text: "No relevant memories found." },
-              ],
-              details: { count: 0 },
-            };
-          }
-
-          const text = results
-            .map(
-              (r, i) =>
-                `${i + 1}. ${r.memory} (score: ${((r.score ?? 0) * 100).toFixed(0)}%, id: ${r.id})`,
-            )
-            .join("\n");
-
-          const sanitized = results.map((r) => ({
-            id: r.id,
-            memory: r.memory,
-            score: r.score,
-            categories: r.categories,
-            created_at: r.created_at,
-          }));
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Found ${results.length} memories:\n\n${text}`,
-              },
-            ],
-            details: { count: results.length, memories: sanitized },
-          };
-        } catch (err) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory search failed: ${String(err)}`,
-              },
-            ],
-            details: { error: String(err) },
-          };
-        }
-      },
-    },
-    { name: "memory_search" },
-  );
-
-  api.registerTool(
-    {
-      name: "memory_store",
-      label: "Memory Store",
-      description:
-        "Save important information in long-term memory via Mem0. Use for preferences, facts, decisions, and anything worth remembering.",
-      parameters: Type.Object({
-        text: Type.String({ description: "Information to remember" }),
-        userId: Type.Optional(
-          Type.String({
-            description: "User ID to scope this memory",
-          }),
-        ),
-        agentId: Type.Optional(
-          Type.String({
-            description:
-              "Agent ID to store memory under a specific agent's namespace (e.g. \"researcher\"). Overrides userId.",
-          }),
-        ),
-        metadata: Type.Optional(
-          Type.Record(Type.String(), Type.Unknown(), {
-            description: "Optional metadata to attach to this memory",
-          }),
-        ),
-        longTerm: Type.Optional(
-          Type.Boolean({
-            description:
-              "Store as long-term (user-scoped) memory. Default: true. Set to false for session-scoped memory.",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        const { text, userId, agentId, longTerm = true } = params as {
-          text: string;
-          userId?: string;
-          agentId?: string;
-          metadata?: Record<string, unknown>;
-          longTerm?: boolean;
-        };
-
-        try {
-          const uid = _resolveUserId({ agentId, userId });
-          const currentSessionId = getCurrentSessionId();
-          const runId = !longTerm && currentSessionId ? currentSessionId : undefined;
-
-          // Pre-check for near-duplicates so the extraction model has
-          // context about existing memories and can UPDATE rather than ADD
-          const preview = text.slice(0, 200);
-          const dedupOpts = buildSearchOptions(uid, 3);
-          dedupOpts.threshold = 0.85;
-          const existing = await provider.search(preview, dedupOpts);
-          if (existing.length > 0) {
-            api.logger.info(
-              `openclaw-mem0: found ${existing.length} similar existing memories — mem0 may update instead of add`,
-            );
-          }
-
-          const result = await provider.add(
-            [{ role: "user", content: text }],
-            buildAddOptions(uid, runId, currentSessionId),
-          );
-
-          const added =
-            result.results?.filter((r) => r.event === "ADD") ?? [];
-          const updated =
-            result.results?.filter((r) => r.event === "UPDATE") ?? [];
-
-          const summary = [];
-          if (added.length > 0)
-            summary.push(
-              `${added.length} new memor${added.length === 1 ? "y" : "ies"} added`,
-            );
-          if (updated.length > 0)
-            summary.push(
-              `${updated.length} memor${updated.length === 1 ? "y" : "ies"} updated`,
-            );
-          if (summary.length === 0)
-            summary.push("No new memories extracted");
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Stored: ${summary.join(", ")}. ${result.results?.map((r) => `[${r.event}] ${r.memory}`).join("; ") ?? ""}`,
-              },
-            ],
-            details: {
-              action: "stored",
-              results: result.results,
-            },
-          };
-        } catch (err) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory store failed: ${String(err)}`,
-              },
-            ],
-            details: { error: String(err) },
-          };
-        }
-      },
-    },
-    { name: "memory_store" },
-  );
-
-  api.registerTool(
-    {
-      name: "memory_get",
-      label: "Memory Get",
-      description: "Retrieve a specific memory by its ID from Mem0.",
-      parameters: Type.Object({
-        memoryId: Type.String({ description: "The memory ID to retrieve" }),
-      }),
-      async execute(_toolCallId, params) {
-        const { memoryId } = params as { memoryId: string };
-
-        try {
-          const memory = await provider.get(memoryId);
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory ${memory.id}:\n${memory.memory}\n\nCreated: ${memory.created_at ?? "unknown"}\nUpdated: ${memory.updated_at ?? "unknown"}`,
-              },
-            ],
-            details: { memory },
-          };
-        } catch (err) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory get failed: ${String(err)}`,
-              },
-            ],
-            details: { error: String(err) },
-          };
-        }
-      },
-    },
-    { name: "memory_get" },
-  );
-
-  api.registerTool(
-    {
-      name: "memory_list",
-      label: "Memory List",
-      description:
-        "List all stored memories for a user or agent. Use this when you want to see everything that's been remembered, rather than searching for something specific.",
-      parameters: Type.Object({
-        userId: Type.Optional(
-          Type.String({
-            description:
-              "User ID to list memories for (default: configured userId)",
-          }),
-        ),
-        agentId: Type.Optional(
-          Type.String({
-            description:
-              "Agent ID to list memories for a specific agent (e.g. \"researcher\"). Overrides userId.",
-          }),
-        ),
-        scope: Type.Optional(
-          Type.Union([
-            Type.Literal("session"),
-            Type.Literal("long-term"),
-            Type.Literal("all"),
-          ], {
-            description:
-              'Memory scope: "session" (current session only), "long-term" (user-scoped only), or "all" (both). Default: "all"',
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        const { userId, agentId, scope = "all" } = params as { userId?: string; agentId?: string; scope?: "session" | "long-term" | "all" };
-
-        try {
-          let memories: MemoryItem[] = [];
-          const uid = _resolveUserId({ agentId, userId });
-          const currentSessionId = getCurrentSessionId();
-
-          if (scope === "session") {
-            if (currentSessionId) {
-              memories = await provider.getAll({
-                user_id: uid,
-                run_id: currentSessionId,
-                source: "OPENCLAW",
-              });
-            }
-          } else if (scope === "long-term") {
-            memories = await provider.getAll({ user_id: uid, source: "OPENCLAW" });
-          } else {
-            // "all" — combine both scopes
-            const longTerm = await provider.getAll({ user_id: uid, source: "OPENCLAW" });
-            let session: MemoryItem[] = [];
-            if (currentSessionId) {
-              session = await provider.getAll({
-                user_id: uid,
-                run_id: currentSessionId,
-                source: "OPENCLAW",
-              });
-            }
-            const seen = new Set(longTerm.map((r) => r.id));
-            memories = [
-              ...longTerm,
-              ...session.filter((r) => !seen.has(r.id)),
-            ];
-          }
-
-          if (!memories || memories.length === 0) {
-            return {
-              content: [
-                { type: "text", text: "No memories stored yet." },
-              ],
-              details: { count: 0 },
-            };
-          }
-
-          const text = memories
-            .map(
-              (r, i) =>
-                `${i + 1}. ${r.memory} (id: ${r.id})`,
-            )
-            .join("\n");
-
-          const sanitized = memories.map((r) => ({
-            id: r.id,
-            memory: r.memory,
-            categories: r.categories,
-            created_at: r.created_at,
-          }));
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `${memories.length} memories:\n\n${text}`,
-              },
-            ],
-            details: { count: memories.length, memories: sanitized },
-          };
-        } catch (err) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory list failed: ${String(err)}`,
-              },
-            ],
-            details: { error: String(err) },
-          };
-        }
-      },
-    },
-    { name: "memory_list" },
-  );
-
-  api.registerTool(
-    {
-      name: "memory_forget",
-      label: "Memory Forget",
-      description:
-        "Delete memories from Mem0. Provide a specific memoryId to delete directly, or a query to search and delete matching memories. Supports agent-scoped deletion. GDPR-compliant.",
-      parameters: Type.Object({
-        query: Type.Optional(
-          Type.String({
-            description: "Search query to find memory to delete",
-          }),
-        ),
-        memoryId: Type.Optional(
-          Type.String({ description: "Specific memory ID to delete" }),
-        ),
-        agentId: Type.Optional(
-          Type.String({
-            description:
-              "Agent ID to scope deletion to a specific agent's memories (e.g. \"researcher\").",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        const { query, memoryId, agentId } = params as {
-          query?: string;
-          memoryId?: string;
-          agentId?: string;
-        };
-
-        try {
-          if (memoryId) {
-            await provider.delete(memoryId);
-            return {
-              content: [
-                { type: "text", text: `Memory ${memoryId} forgotten.` },
-              ],
-              details: { action: "deleted", id: memoryId },
-            };
-          }
-
-          if (query) {
-            const uid = _resolveUserId({ agentId });
-            const results = await provider.search(
-              query,
-              buildSearchOptions(uid, 5),
-            );
-
-            if (!results || results.length === 0) {
-              return {
-                content: [
-                  { type: "text", text: "No matching memories found." },
-                ],
-                details: { found: 0 },
-              };
-            }
-
-            // If single high-confidence match, delete directly
-            if (
-              results.length === 1 ||
-              (results[0].score ?? 0) > 0.9
-            ) {
-              await provider.delete(results[0].id);
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Forgotten: "${results[0].memory}"`,
-                  },
-                ],
-                details: { action: "deleted", id: results[0].id },
-              };
-            }
-
-            const list = results
-              .map(
-                (r) =>
-                  `- [${r.id}] ${r.memory.slice(0, 80)}${r.memory.length > 80 ? "..." : ""} (score: ${((r.score ?? 0) * 100).toFixed(0)}%)`,
-              )
-              .join("\n");
-
-            const candidates = results.map((r) => ({
-              id: r.id,
-              memory: r.memory,
-              score: r.score,
-            }));
-
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Found ${results.length} candidates. Specify memoryId to delete:\n${list}`,
-                },
-              ],
-              details: { action: "candidates", candidates },
-            };
-          }
-
-          return {
-            content: [
-              { type: "text", text: "Provide a query or memoryId." },
-            ],
-            details: { error: "missing_param" },
-          };
-        } catch (err) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Memory forget failed: ${String(err)}`,
-              },
-            ],
-            details: { error: String(err) },
-          };
-        }
-      },
-    },
-    { name: "memory_forget" },
-  );
-}
-
-// ============================================================================
-// CLI Registration
-// ============================================================================
-
-function registerCli(
-  api: OpenClawPluginApi,
-  provider: Mem0Provider,
-  cfg: Mem0Config,
-  _effectiveUserId: (sessionKey?: string) => string,
-  _agentUserId: (id: string) => string,
-  buildSearchOptions: (userIdOverride?: string, limit?: number, runId?: string, sessionKey?: string) => SearchOptions,
-  getCurrentSessionId: () => string | undefined,
-) {
-  api.registerCli(
-    ({ program }) => {
-      const mem0 = program
-        .command("mem0")
-        .description("Mem0 memory plugin commands");
-
-      mem0
-        .command("search")
-        .description("Search memories in Mem0")
-        .argument("<query>", "Search query")
-        .option("--limit <n>", "Max results", String(cfg.topK))
-        .option("--scope <scope>", 'Memory scope: "session", "long-term", or "all"', "all")
-        .option("--agent <agentId>", "Search a specific agent's memory namespace")
-        .action(async (query: string, opts: { limit: string; scope: string; agent?: string }) => {
-          try {
-            const limit = parseInt(opts.limit, 10);
-            const scope = opts.scope as "session" | "long-term" | "all";
-            const currentSessionId = getCurrentSessionId();
-            const uid = opts.agent ? _agentUserId(opts.agent) : _effectiveUserId(currentSessionId);
-
-            let allResults: MemoryItem[] = [];
-
-            if (scope === "session" || scope === "all") {
-              if (currentSessionId) {
-                const sessionResults = await provider.search(
-                  query,
-                  buildSearchOptions(uid, limit, currentSessionId),
-                );
-                if (sessionResults?.length) {
-                  allResults.push(...sessionResults.map((r) => ({ ...r, _scope: "session" as const })));
-                }
-              } else if (scope === "session") {
-                console.log("No active session ID available for session-scoped search.");
-                return;
-              }
-            }
-
-            if (scope === "long-term" || scope === "all") {
-              const longTermResults = await provider.search(
-                query,
-                buildSearchOptions(uid, limit),
-              );
-              if (longTermResults?.length) {
-                allResults.push(...longTermResults.map((r) => ({ ...r, _scope: "long-term" as const })));
-              }
-            }
-
-            // Deduplicate by ID when searching "all"
-            if (scope === "all") {
-              const seen = new Set<string>();
-              allResults = allResults.filter((r) => {
-                if (seen.has(r.id)) return false;
-                seen.add(r.id);
-                return true;
-              });
-            }
-
-            if (!allResults.length) {
-              console.log("No memories found.");
-              return;
-            }
-
-            const output = allResults.map((r) => ({
-              id: r.id,
-              memory: r.memory,
-              score: r.score,
-              scope: (r as any)._scope,
-              categories: r.categories,
-              created_at: r.created_at,
-            }));
-            console.log(JSON.stringify(output, null, 2));
-          } catch (err) {
-            console.error(`Search failed: ${String(err)}`);
-          }
-        });
-
-      mem0
-        .command("stats")
-        .description("Show memory statistics from Mem0")
-        .option("--agent <agentId>", "Show stats for a specific agent")
-        .action(async (opts: { agent?: string }) => {
-          try {
-            const uid = opts.agent ? _agentUserId(opts.agent) : cfg.userId;
-            const memories = await provider.getAll({
-              user_id: uid,
-              source: "OPENCLAW",
-            });
-            console.log(`Mode: ${cfg.mode}`);
-            console.log(`User: ${uid}${opts.agent ? ` (agent: ${opts.agent})` : ""}`);
-            console.log(
-              `Total memories: ${Array.isArray(memories) ? memories.length : "unknown"}`,
-            );
-            console.log(`Graph enabled: ${cfg.enableGraph}`);
-            console.log(
-              `Auto-recall: ${cfg.autoRecall}, Auto-capture: ${cfg.autoCapture}`,
-            );
-          } catch (err) {
-            console.error(`Stats failed: ${String(err)}`);
-          }
-        });
-    },
-    { commands: ["mem0"] },
-  );
-}
-
-// ============================================================================
-// Context-Aware Recall Query Builder
-// ============================================================================
-
-/**
- * Build an enriched search query for memory recall by combining the current
- * prompt with the previous turn's context. This improves recall quality for
- * short/vague prompts like "继续" (continue) or "go on" by anchoring the
- * search to the topic of the previous exchange.
- *
- * Strategy:
- * - If current prompt is long enough (≥80 chars), use it directly — it has
- *   enough semantic signal on its own.
- * - Otherwise, prepend the previous user message + assistant reply (head-truncated)
- *   to provide topical context for the vector search.
- * - Noise filtering: skip generic assistant replies ("ok", "got it", etc.)
- */
-function buildRecallQuery(
-  currentPrompt: string,
-  lastTurn: { userMessage: string; assistantReply: string } | null,
-): string {
-  // Strip media metadata and other noise from the prompt before using as search query
-  const cleanPrompt = stripNoiseFromContent(currentPrompt);
-
-  // Long prompts have sufficient semantic signal
-  if (cleanPrompt.length >= 80 || !lastTurn) return cleanPrompt;
-
-  const parts: string[] = [];
-
-  // Previous user message (provides topic context)
-  if (lastTurn.userMessage) {
-    parts.push(lastTurn.userMessage);
-  }
-
-  // Previous assistant reply (provides conclusion/topic anchor)
-  // Skip if it's a noise/generic response
-  if (
-    lastTurn.assistantReply &&
-    lastTurn.assistantReply.length >= 10 &&
-    !/^(ok|got it|sure|is there anything|how can i help|understood|done)/i.test(
-      lastTurn.assistantReply,
-    )
-  ) {
-    parts.push(lastTurn.assistantReply);
-  }
-
-  // Current prompt always goes last (highest semantic weight for embedding)
-  parts.push(cleanPrompt);
-
-  return parts.join("\n");
-}
+});
 
 // ============================================================================
 // Lifecycle Hook Registration
@@ -900,80 +534,391 @@ function registerHooks(
   provider: Mem0Provider,
   cfg: Mem0Config,
   _effectiveUserId: (sessionKey?: string) => string,
-  buildAddOptions: (userIdOverride?: string, runId?: string, sessionKey?: string) => AddOptions,
-  buildSearchOptions: (userIdOverride?: string, limit?: number, runId?: string, sessionKey?: string) => SearchOptions,
+  buildAddOptions: (
+    userIdOverride?: string,
+    runId?: string,
+    sessionKey?: string,
+  ) => AddOptions,
+  buildSearchOptions: (
+    userIdOverride?: string,
+    limit?: number,
+    runId?: string,
+    sessionKey?: string,
+  ) => SearchOptions,
   session: {
     setCurrentSessionId: (id: string) => void;
+    getStateDir: () => string | undefined;
   },
+  skillsActive: boolean = false,
+  _captureEvent: (event: string, props?: Record<string, unknown>) => void = () => {},
 ) {
-  // Cache last turn for context-aware recall: agent_end writes, before_agent_start reads
-  // Keyed by sessionKey to prevent cross-channel contamination
-  const lastTurnBySession = new Map<string, { userMessage: string; assistantReply: string }>();
+  const lastTurnBySession = new Map<string, LastTurn>();
+  const injectedBySession = new Map<string, InjectionState>();
 
-  // Track injected memory IDs per session for smart deduplication
-  // Uses exponential decay (Ebbinghaus-inspired) to balance token efficiency vs attention retention
-  const injectedBySession = new Map<string, { ids: Set<string>; turnsSinceRefresh: number }>();
-  const DECAY_RATE = 0.2; // λ in threshold = 0.8 × e^(-λt), higher = more aggressive refresh
+  // ========================================================================
+  // SKILLS MODE: Agentic memory via before_prompt_build
+  // ========================================================================
+  if (skillsActive) {
+    // Use before_prompt_build instead of before_agent_start:
+    // - prependSystemContext: static memory protocol (provider-cacheable, no per-turn cost)
+    // - prependContext: dynamic recalled memories (changes every turn)
+    //
+    // Recall query building must stay session-scoped because last-turn context
+    // is keyed by session to avoid cross-channel contamination.
+    api.on("before_prompt_build", async (event: any, ctx: any) => {
+      if (!event.prompt || event.prompt.length < 5) return;
 
-  // Auto-recall: inject relevant memories before agent starts
+      const trigger = ctx?.trigger ?? undefined;
+      const sessionId = ctx?.sessionKey ?? undefined;
+      if (isNonInteractiveTrigger(trigger, sessionId)) {
+        api.logger.info(
+          "openclaw-mem0: skills-mode skipping non-interactive trigger",
+        );
+        return;
+      }
+
+      // Skip recall for system/bootstrap prompts. These are OpenClaw internal
+      // commands (/new, /reset) that contain system instructions, not user queries.
+      // Sending them to mem0 search wastes API calls and returns noise.
+      const promptLower = event.prompt.toLowerCase();
+      const isSystemPrompt =
+        promptLower.includes("a new session was started") ||
+        promptLower.includes("session startup sequence") ||
+        promptLower.includes("/new or /reset") ||
+        promptLower.startsWith("system:") ||
+        promptLower.startsWith("run your session");
+      if (isSystemPrompt) {
+        api.logger.info(
+          "openclaw-mem0: skills-mode skipping recall for system/bootstrap prompt",
+        );
+        // Still inject the protocol, just skip recall search
+        const systemContext = loadTriagePrompt(cfg.skills ?? {});
+        return { prependSystemContext: systemContext };
+      }
+
+      if (sessionId) session.setCurrentSessionId(sessionId);
+
+      const isSubagent = isSubagentSession(sessionId);
+      const userId = _effectiveUserId(isSubagent ? undefined : sessionId);
+
+      // Static protocol goes in prependSystemContext (cacheable across turns)
+      let systemContext = loadTriagePrompt(cfg.skills ?? {});
+      if (isSubagent) {
+        systemContext =
+          "You are a subagent — use these memories for context but do not assume you are this user. Do NOT store new memories.\n\n" +
+          systemContext;
+      }
+
+      // Dynamic recall goes in prependContext (changes every turn).
+      // Strategy controls how much the plugin searches automatically:
+      //   "always" — long-term + session search every turn (2 searches)
+      //   "smart"  — long-term search only, no session search (1 search) [default]
+      //   "manual" — no auto-recall; agent controls all search via memory_search (0 searches)
+      let recallContext = "";
+      const recallEnabled = cfg.skills?.recall?.enabled !== false;
+      const recallStrategy = cfg.skills?.recall?.strategy ?? "smart";
+
+      if (recallEnabled && recallStrategy !== "manual") {
+        const recallStart = Date.now();
+        try {
+          const lastTurn = sessionId
+            ? lastTurnBySession.get(sessionId) ?? null
+            : null;
+          const query = buildRecallQuery(event.prompt, lastTurn);
+
+          // Smart mode: skip session search (saves 1 API call per turn)
+          const sessionIdForRecall =
+            recallStrategy === "always"
+              ? isSubagent
+                ? undefined
+                : sessionId
+              : undefined; // smart: long-term only
+
+          const recallResult = await skillRecall(
+            provider,
+            query,
+            userId,
+            cfg.skills ?? {},
+            sessionIdForRecall,
+          );
+
+          api.logger.info(
+            `openclaw-mem0: skills-mode recall (strategy=${recallStrategy}, hasContext=${lastTurn != null}) injecting ${recallResult.memories.length} memories (~${recallResult.tokenEstimate} tokens)`,
+          );
+
+          _captureEvent("openclaw.hook.recall", {
+            strategy: recallStrategy,
+            memory_count: recallResult.memories.length,
+            has_context: lastTurn != null,
+            latency_ms: Date.now() - recallStart,
+          });
+
+          if (recallResult.memories.length > 0) {
+            const preamble = isSubagent
+              ? `The following are stored memories for user "${cfg.userId}". You are a subagent — use these memories for context but do not assume you are this user.`
+              : `The following are stored memories for user "${cfg.userId}". Use them to personalize your response:`;
+            const injected = buildInjectedContext(
+              recallResult.memories,
+              sessionId,
+              preamble,
+              injectedBySession,
+            );
+            api.logger.info(
+              `openclaw-mem0: skills-mode injecting ${injected.totalCount} memories (${injected.newCount} new, ${injected.repeatCount} repeat, ${injected.fullRefresh ? "FULL" : "DIFF"})`,
+            );
+            recallContext = injected.context;
+          } else {
+            recallContext = recallResult.context;
+          }
+        } catch (err) {
+          api.logger.warn(
+            `openclaw-mem0: skills-mode recall failed: ${String(err)}`,
+          );
+        }
+      } else if (recallEnabled && recallStrategy === "manual") {
+        api.logger.info(
+          "openclaw-mem0: skills-mode recall strategy=manual, agent controls search",
+        );
+      }
+
+      // Auto-dream: check CHEAP gates first (local file reads only).
+      // Only hit the API for memory count if time + session gates pass.
+      const stateDir = session.getStateDir();
+      const dreamEnabled =
+        cfg.skills?.dream?.enabled !== false &&
+        cfg.skills?.dream?.auto !== false;
+      let dreamContext = "";
+      if (dreamEnabled && stateDir && !isSubagent) {
+        try {
+          const cheapResult = checkCheapGates(
+            stateDir,
+            cfg.skills?.dream ?? {},
+          );
+          if (cheapResult.proceed) {
+            // Cheap gates passed. Now do the expensive memory count check.
+            const memories = await provider.getAll({
+              user_id: userId,
+              source: "OPENCLAW",
+            });
+            const memCount = Array.isArray(memories) ? memories.length : 0;
+            const memResult = checkMemoryGate(
+              memCount,
+              cfg.skills?.dream ?? {},
+            );
+            if (memResult.pass && acquireDreamLock(stateDir)) {
+              const dreamPrompt = loadDreamPrompt(cfg.skills ?? {});
+              if (dreamPrompt) {
+                dreamContext =
+                  "\n\n<auto-dream>\nIMPORTANT: Before responding to the user, run a memory consolidation pass. Follow the protocol below, then respond normally.\n\n" +
+                  dreamPrompt +
+                  "\n</auto-dream>";
+                // Track which session triggered dream (session-keyed, not global)
+                dreamSessionId = sessionId;
+                _captureEvent("openclaw.hook.dream", { phase: "triggered", memory_count: memCount });
+                api.logger.info(
+                  `openclaw-mem0: auto-dream triggered (${memCount} memories, gate passed)`,
+                );
+              } else {
+                releaseDreamLock(stateDir);
+              }
+            }
+          }
+        } catch (err) {
+          api.logger.warn(
+            `openclaw-mem0: auto-dream gate check failed: ${String(err)}`,
+          );
+        }
+      }
+
+      return {
+        prependSystemContext: systemContext, // cached by provider
+        prependContext: recallContext + dreamContext, // per-turn dynamic
+      };
+    });
+
+    // Session-keyed dream tracking. Only the session that triggered dream
+    // can complete it. Prevents cross-session false completion.
+    let dreamSessionId: string | undefined;
+
+    api.on("agent_end", async (event: any, ctx: any) => {
+      const sessionId = ctx?.sessionKey ?? undefined;
+      const trigger = ctx?.trigger ?? undefined;
+      if (sessionId) session.setCurrentSessionId(sessionId);
+      if (event.success) {
+        cacheLastTurnForSession(
+          sessionId,
+          event.messages,
+          lastTurnBySession,
+          api,
+        );
+      }
+
+      // If dream was triggered for THIS session, handle cleanup regardless
+      // of success/failure. A failed turn must still release the lock.
+      const stateDir = session.getStateDir();
+      if (dreamSessionId && dreamSessionId === sessionId && stateDir) {
+        dreamSessionId = undefined;
+
+        if (!event.success) {
+          // Turn failed/aborted after lock acquired. Release lock, do not
+          // record completion. Gates will re-trigger next eligible turn.
+          releaseDreamLock(stateDir);
+          api.logger.warn(
+            "openclaw-mem0: auto-dream turn failed, lock released, will retry",
+          );
+          return;
+        }
+
+        // Verify the model actually performed WRITE operations (not just reads).
+        // Only count memory_add, memory_update, memory_delete.
+        // Exclude memory_list and memory_search (read-only, orient-only pass).
+        // Scan only the LAST assistant message (this turn), not the full session
+        // snapshot, to avoid matching earlier tool calls from prior turns.
+        const WRITE_TOOLS = new Set([
+          "memory_add",
+          "memory_update",
+          "memory_delete",
+        ]);
+        const messages = event.messages ?? [];
+        // Find the last assistant message (this turn's output)
+        const lastAssistant = [...messages]
+          .reverse()
+          .find((m: any) => m.role === "assistant");
+        const writeToolUsed =
+          lastAssistant && Array.isArray(lastAssistant.content)
+            ? lastAssistant.content.some(
+                (block: any) =>
+                  block.type === "tool_use" && WRITE_TOOLS.has(block.name),
+              )
+            : false;
+
+        if (writeToolUsed) {
+          releaseDreamLock(stateDir);
+          recordDreamCompletion(stateDir);
+          _captureEvent("openclaw.hook.dream", { phase: "completed", write_tools_used: true });
+          api.logger.info(
+            "openclaw-mem0: auto-dream completed (verified write tool usage), lock released",
+          );
+        } else {
+          releaseDreamLock(stateDir);
+          api.logger.warn(
+            "openclaw-mem0: auto-dream injected but no write tools executed. Lock released, will retry.",
+          );
+        }
+        return;
+      }
+
+      if (!event.success) return;
+
+      // Track session for dream gating (interactive turns only)
+      if (
+        stateDir &&
+        sessionId &&
+        !isNonInteractiveTrigger(trigger, sessionId)
+      ) {
+        incrementSessionCount(stateDir, sessionId);
+      }
+
+      api.logger.info("openclaw-mem0: skills-mode agent_end (no auto-capture)");
+    });
+
+    return; // Skip legacy hook registration
+  }
+
+  // ========================================================================
+  // LEGACY MODE: Original auto-recall + auto-capture behavior
+  // ========================================================================
+
+  // Track last seen session ID to detect actual new sessions (not every turn)
+  let lastRecallSessionId: string | undefined;
+
+  // Auto-recall: inject relevant memories before prompt is built
   if (cfg.autoRecall) {
-    api.on("before_agent_start", async (event, ctx) => {
-      if (!event.prompt || event.prompt.length < 2) return;
+    const RECALL_TIMEOUT_MS = 8_000;
+
+    api.on("before_prompt_build", async (event: any, ctx: any) => {
+      if (!event.prompt || event.prompt.length < 5) return;
 
       // Skip non-interactive triggers (cron, heartbeat, automation)
       const trigger = (ctx as any)?.trigger ?? undefined;
       const sessionId = (ctx as any)?.sessionKey ?? undefined;
       if (isNonInteractiveTrigger(trigger, sessionId)) {
-        api.logger.info("openclaw-mem0: skipping recall for non-interactive trigger");
+        api.logger.info(
+          "openclaw-mem0: skipping recall for non-interactive trigger",
+        );
+        return;
+      }
+
+      // Skip recall for system/bootstrap prompts to save API calls
+      const promptLower = event.prompt.toLowerCase();
+      const isSystemPrompt =
+        promptLower.includes("a new session was started") ||
+        promptLower.includes("session startup sequence") ||
+        promptLower.includes("/new or /reset") ||
+        promptLower.startsWith("system:") ||
+        promptLower.startsWith("run your session");
+      if (isSystemPrompt) {
+        api.logger.info(
+          "openclaw-mem0: skipping recall for system/bootstrap prompt",
+        );
         return;
       }
 
       // Update shared state for tools (best-effort — tools don't have ctx)
       if (sessionId) session.setCurrentSessionId(sessionId);
 
-      // Detect new session for cold-start broadening
-      const isNewSession = true; // treat every hook invocation as potentially new
+      // Detect actual new session (first turn with a different sessionKey)
+      const isNewSession =
+        sessionId !== undefined && sessionId !== lastRecallSessionId;
+      if (sessionId) lastRecallSessionId = sessionId;
 
       // Subagents have ephemeral UUIDs — their namespace is always empty.
       // Search the parent (main) user namespace instead so subagents get
       // the user's long-term context.
       const isSubagent = isSubagentSession(sessionId);
       const recallSessionKey = isSubagent ? undefined : sessionId;
+      const lastTurn = sessionId
+        ? lastTurnBySession.get(sessionId) ?? null
+        : null;
+      const searchQuery = buildRecallQuery(event.prompt, lastTurn);
 
-      try {
-        // Build context-aware search query from last turn + current prompt
-        const lastTurn = sessionId ? lastTurnBySession.get(sessionId) ?? null : null;
-        const searchQuery = buildRecallQuery(event.prompt, lastTurn);
-        api.logger.info(
-          `openclaw-mem0: recall query (${searchQuery.length} chars, hasContext: ${lastTurn != null}, session: ${sessionId?.slice(-20)}):\n${searchQuery.slice(0, 500)}`,
-        );
-
-        // Use a larger candidate pool for recall, then filter down
+      const recallStart = Date.now();
+      const recallWork = async () => {
         const recallTopK = Math.max((cfg.topK ?? 5) * 2, 10);
-
-        // Fire all 3 search requests in parallel to avoid serial latency
-        const needsBroad = event.prompt.length < 100 || isNewSession;
-        const broadOpts = buildSearchOptions(undefined, 5, undefined, recallSessionKey);
+        const needsBroad = searchQuery.length < 100 || isNewSession;
+        const broadOpts = buildSearchOptions(
+          undefined,
+          5,
+          undefined,
+          recallSessionKey,
+        );
         broadOpts.threshold = 0.5;
 
         const [rawLongTerm, broadResults, rawSession] = await Promise.all([
-          // 1. Long-term memories (user-scoped; subagents read from parent namespace)
           provider.search(
             searchQuery,
-            buildSearchOptions(undefined, recallTopK, undefined, recallSessionKey),
+            buildSearchOptions(
+              undefined,
+              recallTopK,
+              undefined,
+              recallSessionKey,
+            ),
           ),
-          // 2. Broad recall for short/generic prompts or new sessions
           needsBroad
             ? provider.search(
                 "recent decisions, preferences, active projects, and configuration",
                 broadOpts,
               )
             : Promise.resolve([] as MemoryItem[]),
-          // 3. Session memories (session-scoped)
           sessionId
             ? provider.search(
                 searchQuery,
-                buildSearchOptions(undefined, undefined, sessionId, recallSessionKey),
+                buildSearchOptions(
+                  undefined,
+                  undefined,
+                  sessionId,
+                  recallSessionKey,
+                ),
               )
             : Promise.resolve([] as MemoryItem[]),
         ]);
@@ -997,7 +942,6 @@ function registerHooks(
           }
         }
 
-        // Merge broad results (deduplicated)
         if (broadResults.length > 0) {
           const existingIds = new Set(longTermResults.map((r) => r.id));
           for (const r of broadResults) {
@@ -1010,83 +954,87 @@ function registerHooks(
         // Cap at configured topK after filtering
         longTermResults = longTermResults.slice(0, cfg.topK);
 
-        // Filter session results
-        let sessionResults = rawSession.filter(
+        const sessionResults = rawSession.filter(
           (r) => (r.score ?? 0) >= cfg.searchThreshold,
         );
-
-        // Deduplicate session results against long-term
         const longTermIds = new Set(longTermResults.map((r) => r.id));
         const uniqueSessionResults = sessionResults.filter(
           (r) => !longTermIds.has(r.id),
         );
 
-        if (longTermResults.length === 0 && uniqueSessionResults.length === 0) return;
+        if (longTermResults.length === 0 && uniqueSessionResults.length === 0) {
+          return undefined;
+        }
 
-        // Smart injection: avoid repeating memories that were already injected
         const allResults = [...longTermResults, ...uniqueSessionResults];
-        const injState = sessionId
-          ? injectedBySession.get(sessionId) ?? { ids: new Set<string>(), turnsSinceRefresh: 0 }
+        const injectionState = sessionId
+          ? injectedBySession.get(sessionId) ?? {
+              ids: new Set<string>(),
+              turnsSinceRefresh: 0,
+            }
           : { ids: new Set<string>(), turnsSinceRefresh: 0 };
 
-        const newMemories = allResults.filter((r) => !injState.ids.has(r.id));
-        const repeatMemories = allResults.filter((r) => injState.ids.has(r.id));
-        const newRatio = allResults.length > 0 ? newMemories.length / allResults.length : 1;
+        const newMemories = allResults.filter(
+          (memory) => !injectionState.ids.has(memory.id),
+        );
+        const repeatMemories = allResults.filter((memory) =>
+          injectionState.ids.has(memory.id),
+        );
+        const newRatio =
+          allResults.length > 0 ? newMemories.length / allResults.length : 1;
+        const threshold =
+          0.8 * Math.exp(-DECAY_RATE * injectionState.turnsSinceRefresh);
+        const isFullRefresh =
+          newRatio > threshold || injectionState.ids.size === 0;
 
-        // Exponential decay threshold (Ebbinghaus-inspired):
-        // Early turns: high threshold (50%) — only refresh on topic change
-        // Later turns: threshold decays → easier to trigger refresh for attention retention
-        const threshold = 0.8 * Math.exp(-DECAY_RATE * injState.turnsSinceRefresh);
-        const isFullRefresh = newRatio > threshold || injState.ids.size === 0;
-
-        // Build context with smart deduplication
         let memoryContext = "";
         if (isFullRefresh) {
-          // Full injection: all memories with complete content
           if (longTermResults.length > 0) {
-            memoryContext += longTermResults
-              .map(
-                (r) =>
-                  `- ${r.memory}${r.categories?.length ? ` [${r.categories.join(", ")}]` : ""}`,
-              )
-              .join("\n");
+            memoryContext += longTermResults.map(formatMemoryLine).join("\n");
           }
           if (uniqueSessionResults.length > 0) {
             if (memoryContext) memoryContext += "\n";
             memoryContext += "\nSession memories:\n";
-            memoryContext += uniqueSessionResults
-              .map((r) => `- ${r.memory}`)
-              .join("\n");
+            memoryContext += uniqueSessionResults.map(formatMemoryLine).join("\n");
           }
-          injState.turnsSinceRefresh = 0;
+          injectionState.turnsSinceRefresh = 0;
         } else {
-          // Differential injection: new memories full, repeated memories condensed
           if (newMemories.length > 0) {
             memoryContext += "New context:\n";
-            memoryContext += newMemories
-              .map(
-                (r) =>
-                  `- ${r.memory}${r.categories?.length ? ` [${r.categories.join(", ")}]` : ""}`,
-              )
-              .join("\n");
+            memoryContext += newMemories.map(formatMemoryLine).join("\n");
           }
           if (repeatMemories.length > 0) {
             if (memoryContext) memoryContext += "\n";
             memoryContext += "\nPreviously noted (still relevant):\n";
             memoryContext += repeatMemories
-              .map((r) => `- ${r.memory.slice(0, 60)}${r.memory.length > 60 ? "..." : ""}`)
+              .map((memory) => `- ${memory.memory.slice(0, 60)}${memory.memory.length > 60 ? "..." : ""}`)
               .join("\n");
           }
-          injState.turnsSinceRefresh++;
+          injectionState.turnsSinceRefresh++;
         }
 
-        // Update injected state
-        allResults.forEach((r) => injState.ids.add(r.id));
-        if (sessionId) injectedBySession.set(sessionId, injState);
+        for (const memory of allResults) {
+          injectionState.ids.add(memory.id);
+        }
+        if (sessionId) {
+          injectedBySession.set(sessionId, injectionState);
+          if (injectedBySession.size > 50) {
+            const oldestKey = injectedBySession.keys().next().value;
+            if (oldestKey) injectedBySession.delete(oldestKey);
+          }
+        }
 
-        const totalCount = allResults.length;
+        _captureEvent("openclaw.hook.recall", {
+          strategy: "legacy",
+          memory_count: allResults.length,
+          new_count: newMemories.length,
+          repeat_count: repeatMemories.length,
+          has_context: lastTurn != null,
+          latency_ms: Date.now() - recallStart,
+        });
+
         api.logger.info(
-          `openclaw-mem0: injecting ${totalCount} memories (${newMemories.length} new, ${repeatMemories.length} repeat, ${isFullRefresh ? "FULL" : "DIFF"}, threshold: ${(threshold * 100).toFixed(0)}%, decay turn: ${injState.turnsSinceRefresh})`,
+          `openclaw-mem0: recall query (${searchQuery.length} chars, hasContext=${lastTurn != null}) injected ${allResults.length} memories (${newMemories.length} new, ${repeatMemories.length} repeat, ${isFullRefresh ? "FULL" : "DIFF"})`,
         );
 
         const preamble = isSubagent
@@ -1096,13 +1044,29 @@ function registerHooks(
         return {
           prependContext: `<relevant-memories>\n${preamble}\n${memoryContext}\n</relevant-memories>`,
         };
+      };
+
+      try {
+        const timeout = new Promise<undefined>((resolve) => {
+          setTimeout(() => resolve(undefined), RECALL_TIMEOUT_MS);
+        });
+        const result = await Promise.race([
+          recallWork(),
+          timeout.then(() => {
+            api.logger.warn(
+              `openclaw-mem0: recall timed out after ${RECALL_TIMEOUT_MS}ms, skipping`,
+            );
+            return undefined;
+          }),
+        ]);
+        return result;
       } catch (err) {
         api.logger.warn(`openclaw-mem0: recall failed: ${String(err)}`);
       }
     });
   }
 
-  // Auto-capture: store conversation context after agent ends
+  // Auto-capture: store conversation context after agent ends.
   if (cfg.autoCapture) {
     api.on("agent_end", async (event, ctx) => {
       if (!event.success || !event.messages || event.messages.length === 0) {
@@ -1113,7 +1077,9 @@ function registerHooks(
       const trigger = (ctx as any)?.trigger ?? undefined;
       const sessionId = (ctx as any)?.sessionKey ?? undefined;
       if (isNonInteractiveTrigger(trigger, sessionId)) {
-        api.logger.info("openclaw-mem0: skipping capture for non-interactive trigger");
+        api.logger.info(
+          "openclaw-mem0: skipping capture for non-interactive trigger",
+        );
         return;
       }
 
@@ -1121,164 +1087,189 @@ function registerHooks(
       // namespaces that are never read again. The main agent's agent_end
       // hook captures the consolidated result including subagent output.
       if (isSubagentSession(sessionId)) {
-        api.logger.info("openclaw-mem0: skipping capture for subagent (main agent captures consolidated result)");
+        api.logger.info(
+          "openclaw-mem0: skipping capture for subagent (main agent captures consolidated result)",
+        );
         return;
       }
 
       // Update shared state for tools (best-effort — tools don't have ctx)
       if (sessionId) session.setCurrentSessionId(sessionId);
+      cacheLastTurnForSession(sessionId, event.messages, lastTurnBySession, api);
 
-      try {
-        // Patterns indicating an assistant message contains a summary of
-        // completed work — these are high-value for extraction and should
-        // be included even if they fall outside the recent-message window.
-        const SUMMARY_PATTERNS = [
-          /## What I (Accomplished|Built|Updated)/i,
-          /✅\s*(Done|Complete|All done)/i,
-          /Here's (what I updated|the recap|a summary)/i,
-          /### Changes Made/i,
-          /Implementation Status/i,
-          /All locked in\. Quick summary/i,
-        ];
+      const MEMORY_MUTATE_TOOLS = new Set(["memory_add", "memory_update", "memory_delete"]);
+      const agentUsedMemoryTool = event.messages.some((msg: any) => {
+        if (msg?.role !== "assistant" || !Array.isArray(msg?.content)) return false;
+        return msg.content.some(
+          (block: any) => block?.type === "tool_use" && MEMORY_MUTATE_TOOLS.has(block.name),
+        );
+      });
+      if (agentUsedMemoryTool) {
+        api.logger.info(
+          "openclaw-mem0: skipping auto-capture — agent already used memory tools this turn",
+        );
+        return;
+      }
 
-        // First pass: extract all messages into a typed array
-        const allParsed: Array<{
-          role: string;
-          content: string;
-          index: number;
-          isSummary: boolean;
-        }> = [];
+      // --- Build capture payload synchronously (cheap), then fire-and-forget ---
 
-        for (let i = 0; i < event.messages.length; i++) {
-          const msg = event.messages[i];
-          if (!msg || typeof msg !== "object") continue;
-          const msgObj = msg as Record<string, unknown>;
+      // Patterns indicating an assistant message contains a summary of
+      // completed work — these are high-value for extraction and should
+      // be included even if they fall outside the recent-message window.
+      const SUMMARY_PATTERNS = [
+        /## What I (Accomplished|Built|Updated)/i,
+        /✅\s*(Done|Complete|All done)/i,
+        /Here's (what I updated|the recap|a summary)/i,
+        /### Changes Made/i,
+        /Implementation Status/i,
+        /All locked in\. Quick summary/i,
+      ];
 
-          const role = msgObj.role;
-          if (role !== "user" && role !== "assistant") continue;
+      // First pass: extract all messages into a typed array
+      const allParsed: Array<{
+        role: string;
+        content: string;
+        index: number;
+        isSummary: boolean;
+      }> = [];
 
-          let textContent = "";
-          const content = msgObj.content;
+      for (let i = 0; i < event.messages.length; i++) {
+        const msg = event.messages[i];
+        if (!msg || typeof msg !== "object") continue;
+        const msgObj = msg as Record<string, unknown>;
 
-          if (typeof content === "string") {
-            textContent = content;
-          } else if (Array.isArray(content)) {
-            for (const block of content) {
-              if (
-                block &&
-                typeof block === "object" &&
-                "text" in block &&
-                typeof (block as Record<string, unknown>).text === "string"
-              ) {
-                textContent +=
-                  (textContent ? "\n" : "") +
-                  ((block as Record<string, unknown>).text as string);
-              }
+        const role = msgObj.role;
+        if (role !== "user" && role !== "assistant") continue;
+
+        let textContent = "";
+        const content = msgObj.content;
+
+        if (typeof content === "string") {
+          textContent = content;
+        } else if (Array.isArray(content)) {
+          for (const block of content) {
+            if (
+              block &&
+              typeof block === "object" &&
+              "text" in block &&
+              typeof (block as Record<string, unknown>).text === "string"
+            ) {
+              textContent +=
+                (textContent ? "\n" : "") +
+                ((block as Record<string, unknown>).text as string);
             }
           }
+        }
 
+        if (!textContent) continue;
+        // Strip injected memory context, keep the actual user text
+        if (textContent.includes("<relevant-memories>")) {
+          textContent = textContent
+            .replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g, "")
+            .trim();
           if (!textContent) continue;
-          // Strip injected memory context, keep the actual user text
-          if (textContent.includes("<relevant-memories>")) {
-            textContent = textContent.replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g, "").trim();
-            if (!textContent) continue;
-          }
-
-          const isSummary =
-            role === "assistant" &&
-            SUMMARY_PATTERNS.some((p) => p.test(textContent));
-
-          allParsed.push({
-            role: role as string,
-            content: textContent,
-            index: i,
-            isSummary,
-          });
+        }
+        // Strip OpenClaw sender metadata prefix (prevents storing TUI identity as memory)
+        if (textContent.includes("Sender") && textContent.includes("untrusted metadata")) {
+          textContent = textContent
+            .replace(
+              /Sender\s*\(untrusted metadata\):\s*```json[\s\S]*?```\s*/gi,
+              "",
+            )
+            .trim();
+          if (!textContent) continue;
         }
 
-        if (allParsed.length === 0) return;
+        const isSummary =
+          role === "assistant" &&
+          SUMMARY_PATTERNS.some((p) => p.test(textContent));
 
-        // Select messages: last 20 + any earlier summary messages,
-        // sorted by original index to preserve chronological order.
-        const recentWindow = 20;
-        const recentCutoff = allParsed.length - recentWindow;
-
-        const candidates: typeof allParsed = [];
-
-        // Include summary messages from anywhere in the conversation
-        for (const msg of allParsed) {
-          if (msg.isSummary && msg.index < recentCutoff) {
-            candidates.push(msg);
-          }
-        }
-
-        // Include recent messages
-        const seenIndices = new Set(candidates.map((m) => m.index));
-        for (const msg of allParsed) {
-          if (msg.index >= recentCutoff && !seenIndices.has(msg.index)) {
-            candidates.push(msg);
-          }
-        }
-
-        // Sort by original position so the extraction model sees
-        // messages in the order they actually occurred
-        candidates.sort((a, b) => a.index - b.index);
-
-        const selected = candidates.map((m) => ({
-          role: m.role,
-          content: m.content,
-        }));
-
-        // Apply noise filtering pipeline: drop noise, strip fragments, truncate
-        const formattedMessages = filterMessagesForExtraction(selected);
-
-        if (formattedMessages.length === 0) return;
-
-        // Skip if no meaningful user content remains after filtering
-        if (!formattedMessages.some((m) => m.role === "user")) return;
-
-        // Inject a timestamp preamble so the extraction model can anchor
-        // time-sensitive facts to a concrete date and attribute to the correct user
-        const timestamp = new Date().toISOString().split("T")[0];
-        formattedMessages.unshift({
-          role: "system",
-          content: `Current date: ${timestamp}. The user is identified as "${cfg.userId}". Extract durable facts from this conversation. Include this date when storing time-sensitive information.`,
+        allParsed.push({
+          role: role as string,
+          content: textContent,
+          index: i,
+          isSummary,
         });
-
-        const addOpts = buildAddOptions(undefined, sessionId, sessionId);
-        const result = await provider.add(
-          formattedMessages,
-          addOpts,
-        );
-
-        const capturedCount = result.results?.length ?? 0;
-        if (capturedCount > 0) {
-          api.logger.info(
-            `openclaw-mem0: auto-captured ${capturedCount} memories`,
-          );
-        }
-
-        // Cache last turn for context-aware recall in next before_agent_start
-        const lastUserMsg = allParsed.filter((m) => m.role === "user").pop();
-        const lastAssistantMsg = allParsed.filter((m) => m.role === "assistant").pop();
-        if (lastUserMsg && lastAssistantMsg && sessionId) {
-          const cachedTurn = {
-            userMessage: stripNoiseFromContent(lastUserMsg.content).slice(0, 500),
-            assistantReply: stripNoiseFromContent(lastAssistantMsg.content).slice(-300),
-          };
-          lastTurnBySession.set(sessionId, cachedTurn);
-          // Evict stale entries to prevent unbounded growth (keep last 50 sessions)
-          if (lastTurnBySession.size > 50) {
-            const firstKey = lastTurnBySession.keys().next().value;
-            if (firstKey) lastTurnBySession.delete(firstKey);
-          }
-          api.logger.info(
-            `openclaw-mem0: cached last turn for session ${sessionId.slice(-20)} (user: ${cachedTurn.userMessage.length} chars, assistant: ${cachedTurn.assistantReply.length} chars)`,
-          );
-        }
-      } catch (err) {
-        api.logger.warn(`openclaw-mem0: capture failed: ${String(err)}`);
       }
+
+      if (allParsed.length === 0) return;
+
+      // Select messages: last 20 + any earlier summary messages,
+      // sorted by original index to preserve chronological order.
+      const recentWindow = 20;
+      const recentCutoff = allParsed.length - recentWindow;
+
+      const candidates: typeof allParsed = [];
+
+      // Include summary messages from anywhere in the conversation
+      for (const msg of allParsed) {
+        if (msg.isSummary && msg.index < recentCutoff) {
+          candidates.push(msg);
+        }
+      }
+
+      // Include recent messages
+      const seenIndices = new Set(candidates.map((m) => m.index));
+      for (const msg of allParsed) {
+        if (msg.index >= recentCutoff && !seenIndices.has(msg.index)) {
+          candidates.push(msg);
+        }
+      }
+
+      // Sort by original position so the extraction model sees
+      // messages in the order they actually occurred
+      candidates.sort((a, b) => a.index - b.index);
+
+      const selected = candidates.map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+      // Apply noise filtering pipeline: drop noise, strip fragments, truncate
+      const formattedMessages = filterMessagesForExtraction(selected);
+
+      if (formattedMessages.length === 0) return;
+
+      // Skip if no meaningful user content remains after filtering
+      if (!formattedMessages.some((m) => m.role === "user")) return;
+      const userContent = formattedMessages
+        .filter((m) => m.role === "user")
+        .map((m) => m.content)
+        .join(" ");
+      if (userContent.length < 50) {
+        api.logger.info(
+          "openclaw-mem0: skipping capture — user content too short for meaningful extraction",
+        );
+        return;
+      }
+
+      // Inject a timestamp preamble so the extraction model can anchor
+      // time-sensitive facts to a concrete date and attribute to the correct user
+      const timestamp = new Date().toISOString().split("T")[0];
+      formattedMessages.unshift({
+        role: "system",
+        content: `Current date: ${timestamp}. The user is identified as "${cfg.userId}". Extract durable facts from this conversation. Include this date when storing time-sensitive information.`,
+      });
+
+      const addOpts = buildAddOptions(undefined, sessionId, sessionId);
+      const captureStart = Date.now();
+      provider
+        .add(formattedMessages, addOpts)
+        .then((result) => {
+          const capturedCount = result.results?.length ?? 0;
+          _captureEvent("openclaw.hook.capture", {
+            captured_count: capturedCount,
+            latency_ms: Date.now() - captureStart,
+          });
+          if (capturedCount > 0) {
+            api.logger.info(
+              `openclaw-mem0: auto-captured ${capturedCount} memories`,
+            );
+          }
+        })
+        .catch((err) => {
+          api.logger.warn(`openclaw-mem0: capture failed: ${String(err)}`);
+        });
     });
   }
 }
